@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<!--
+  cv-template.london.html — plain black-and-white, single-column, ATS/UK-finance CV.
+  Serif type, small-caps section headers with a rule, left date gutter, square bullets.
+  No colour, no photo, no graphics. Filled from the same JSON payload as the base
+  template (build-cv-html.mjs), styling the classes emitted by templates/sections/*.
+
+  ── DENSITY ─────────────────────────────────────────────────────────────────
+  This file is the COMPACT preset (targets 1 A4 page). Its roomy twin,
+  cv-template.london.html, targets 2 pages and differs ONLY in the
+  `--- DENSITY BLOCK ---` inside :root. Every vertical measure below is expressed
+  in `em` (or in the --space / --gutter tokens), so density is controlled by that
+  block alone — never by editing individual rules. Any STRUCTURAL change here
+  must be mirrored in the twin.
+
+  Verify the page budget explicitly, it is not guaranteed by CSS:
+    node generate-pdf.mjs <in.html> <out.pdf> --format=a4 --max-pages=1 --strict-pages
+
+  ── Two contracts this file must honour ──────────────────────────────────────
+
+  1. SECTION ORDER. cv-sections-core.mjs removes an optional section (projects,
+     education, certifications, awards) by matching from that section's
+     all-caps marker comment up to a lookahead for the NEXT marker comment, or
+     end-of-input if there is none. A *last* optional section therefore matches
+     through end-of-file and deletes the closing body and html tags with it.
+     The document must end on a NON-optional section — SKILLS — exactly as
+     templates/cv-template.html does. Do not move SKILLS off the bottom.
+
+     Two ways to break this that both fail SILENTLY — the document still
+     renders, it is simply missing content:
+
+     a) A marker comment must be the BARE all-caps section name and nothing
+        else. The boundary lookahead only recognises capitals and spaces, so
+        appending a note to a marker stops it being seen as a boundary, and the
+        preceding section's strip runs past it to end-of-file. Put notes in
+        this banner, never on a marker.
+     b) Never write a literal HTML comment close sequence inside this banner.
+        HTML does not nest comments, so the first one ends the banner early and
+        dumps the remaining prose into the page — and into the ATS text layer.
+
+  2. --page-margin MUST be declared. generate-pdf.mjs injects, as the very last
+     rule in <head>:  @page { size: A4; margin: var(--page-margin, 0.6in); }
+     A local `@page { margin: … }` here loses that cascade. The margin below is
+     honoured only because the custom property exists for the injected rule to
+     read. Same reason the other --tokens exist: config/profile.yml `style:`
+     overrides arrive as a later :root block and can only override variables.
+-->
+<html lang="{{LANG}}">
+<head>
+<meta charset="utf-8">
+<title>{{NAME}} — CV</title>
+<style>
+  /* Themeable tokens — overridable via config/profile.yml `style:` (#1837). */
+  :root {
+    --accent-color: #000;
+    --font-family: Georgia, "Times New Roman", Times, serif;
+
+    /* --- DENSITY BLOCK (compact — targets 1 A4 page) -----------------------
+       The only difference between this template and cv-template.london.html.
+       --space is the vertical rhythm unit every margin below is a multiple of. */
+    --font-size: 9.2pt;
+    --line-height: 1.15;
+    --page-margin: 0.4in;
+    --space: 0.28em;
+    /* --- end density block ------------------------------------------------ */
+
+    /* Single source of truth for the left date gutter. Every element that must
+       line up with the content column derives from these two, so widening the
+       gutter can no longer desynchronise roles, bullets and descriptions (the
+       previous layout hardcoded the sum, 106px, in four separate rules).
+       Sized to hold the longest realistic period, "Feb 2026 - Present", on ONE
+       line: a wrapped date makes grid row 1 two lines tall, which opens a gap
+       between the company and the role beneath it. */
+    --gutter: 8.4em;
+    --gutter-gap: 0.8em;
+  }
+  @page { margin: var(--page-margin); }
+
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    /* Guardrail inherited from the base template: headless Chromium can
+       substitute fi/fl/ffi with U+FB01-FB03 at layout time, and PDF text
+       extractors (what an ATS reads) decode them back — turning "verification"
+       into a keyword an exact-match search misses. Georgia does not trigger
+       this in practice (verified via pypdf on a rendered PDF), but a themed
+       --font-family could, so the guard stays.
+       "lnum" asks for lining figures: Georgia defaults to old-style numerals,
+       which set dates and metrics at uneven heights in a numbers-heavy CV. */
+    font-variant-ligatures: none;
+    font-variant-numeric: lining-nums;
+    font-feature-settings: "liga" 0, "clig" 0, "dlig" 0, "lnum" 1;
+  }
+
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  body {
+    font-family: var(--font-family);
+    font-size: var(--font-size);
+    line-height: var(--line-height);
+    color: var(--accent-color);
+    background: #fff;
+    margin: 0 auto;
+    max-width: {{PAGE_WIDTH}};
+    padding: 0;
+  }
+  a { color: inherit; text-decoration: none; }
+
+  /* === HEADER === */
+  .cv-name {
+    text-align: center;
+    font-size: 1.85em;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    margin-bottom: calc(var(--space) * 0.5);
+  }
+  .contact-row {
+    text-align: center;
+    font-size: 0.82em;
+    color: #222;
+    margin-bottom: var(--space);
+  }
+  .contact-row a { color: #222; }
+  .contact-row .separator { color: #444; margin: 0 0.4em; }
+  /* Keep a contact item whole. Without this the row wraps mid-item and strands
+     a fragment ("France") alone on a centred second line. */
+  .contact-row > a,
+  .contact-row > span:not(.separator) { white-space: nowrap; }
+
+  /* === SECTIONS === */
+  .section { margin-top: calc(var(--space) * 1.4); }
+  .section-title {
+    font-size: 1.05em;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    border-bottom: 1px solid var(--accent-color);
+    padding-bottom: 0.1em;
+    margin-bottom: calc(var(--space) * 0.7);
+  }
+
+  /* === SUMMARY / COMPETENCIES === */
+  /* Left-aligned on purpose: justification without hyphenation opens rivers,
+     and `hyphens: auto` would inject U+00AD soft hyphens into the PDF text
+     layer, splitting keywords for the ATS. */
+  .summary { margin-bottom: calc(var(--space) * 0.2); }
+  /* Rendered as a plain comma-separated run rather than visual tags: ::after
+     content lands in the extracted PDF text, so a comma keeps the ATS reading
+     "Stochastic Modeling, Backtesting" instead of a glyph it has to guess at. */
+  .competency-tag:not(:last-child)::after { content: ", "; }
+
+  /* === ENTRIES: shared left date gutter ===
+     `display: contents` dissolves .job-header / .edu-header so the period and
+     the company become direct grid items of the entry. The whole entry is then
+     one grid: the date sits in column 1, and role / location / bullets all
+     inherit column 2 automatically. The previous flex + margin-left version
+     desynchronised as soon as a date wrapped to two lines — the company stayed
+     on line 1 while the role dropped below the wrapped date. */
+  .job, .edu-item {
+    display: grid;
+    grid-template-columns: var(--gutter) 1fr;
+    column-gap: var(--gutter-gap);
+    margin-bottom: calc(var(--space) * 0.8);
+  }
+  .job-header, .edu-header { display: contents; }
+
+  .job-period, .edu-year {
+    grid-column: 1;
+    grid-row: 1;
+    font-size: 0.88em;
+    color: #333;
+    font-style: italic;
+  }
+  .job-company, .edu-title {
+    grid-column: 2;
+    grid-row: 1;
+    font-weight: 700;
+    font-size: 1.02em;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .job-role, .job-location, .edu-desc, .job ul { grid-column: 2; }
+
+  .job-role { font-style: italic; }
+  .job-location { font-size: 0.88em; color: #444; }
+  /* Own line: the org is italic mixed-case inside an uppercase title, so inline
+     it reads as a run-on and wraps badly ("ECE" / "Paris"). */
+  .edu-org {
+    display: block;
+    font-weight: 400;
+    text-transform: none;
+    font-style: italic;
+    letter-spacing: 0;
+    font-size: 0.92em;
+  }
+
+  .job ul { margin-top: 0.15em; padding-left: 1.4em; }
+  .job li { list-style: square; margin-bottom: 0.05em; }
+
+  /* === PROJECTS ===
+     Indented to the same content column as the entries above, so the page has
+     one left edge instead of two. */
+  .project {
+    margin-bottom: calc(var(--space) * 0.6);
+    margin-left: calc(var(--gutter) + var(--gutter-gap));
+  }
+  .project-title { font-weight: 700; }
+  .project-badge { font-weight: 400; font-style: italic; color: #444; margin-left: 0.5em; font-size: 0.88em; }
+  .project-tech { font-style: italic; color: #444; font-size: 0.88em; }
+
+  /* === SKILLS / CERTIFICATIONS / AWARDS === */
+  .skill-item, .cert-item, .award-item { margin-bottom: calc(var(--space) * 0.2); }
+  .skill-category, .cert-title, .award-title { font-weight: 700; }
+  .cert-org, .award-org { font-style: italic; color: #333; margin-left: 0.5em; }
+  .cert-year, .award-year { color: #333; margin-left: 0.5em; }
+
+  /* === PAGE BREAKS ===
+     Small atomic rows stay whole; a multi-bullet role may still flow across a
+     boundary rather than jumping wholesale and leaving a large gap. Headings
+     stay welded to what follows — that is what stranded the SKILLS title at the
+     foot of page 1 in the previous version. */
+  .cv-name, .contact-row,
+  .edu-item, .cert-item, .award-item, .skill-item, .project {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+  .section-title, .job-company, .job-role, .job-location, .project-title {
+    break-after: avoid;
+    page-break-after: avoid;
+  }
+</style>
+</head>
+<body>
+
+  <div class="cv-name">{{NAME}}</div>
+  <div class="contact-row"></div>
+
+  <!-- PROFESSIONAL SUMMARY -->
+  <div class="section">
+    <div class="section-title">{{SECTION_SUMMARY}}</div>
+    <div class="summary">{{SUMMARY_TEXT}}</div>
+  </div>
+
+  <!-- CORE COMPETENCIES -->
+  <div class="section">
+    <div class="section-title">{{SECTION_COMPETENCIES}}</div>
+    <div class="competencies">{{COMPETENCIES}}</div>
+  </div>
+
+  <!-- EDUCATION -->
+  <div class="section">
+    <div class="section-title">{{SECTION_EDUCATION}}</div>
+    {{EDUCATION}}
+  </div>
+
+  <!-- WORK EXPERIENCE -->
+  <div class="section">
+    <div class="section-title">{{SECTION_EXPERIENCE}}</div>
+    {{EXPERIENCE}}
+  </div>
+
+  <!-- PROJECTS -->
+  <div class="section">
+    <div class="section-title">{{SECTION_PROJECTS}}</div>
+    {{PROJECTS}}
+  </div>
+
+  <!-- CERTIFICATIONS -->
+  <div class="section">
+    <div class="section-title">{{SECTION_CERTIFICATIONS}}</div>
+    {{CERTIFICATIONS}}
+  </div>
+
+  <!-- AWARDS -->
+  <div class="section">
+    <div class="section-title">{{SECTION_AWARDS}}</div>
+    {{AWARDS}}
+  </div>
+
+  <!-- SKILLS -->
+  <div class="section">
+    <div class="section-title">{{SECTION_SKILLS}}</div>
+    {{SKILLS}}
+  </div>
+
+</body>
+</html>
