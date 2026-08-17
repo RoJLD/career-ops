@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { pathToFileURL } from 'url';
 import { hasFlag } from './lib/cli-flags.mjs';
-import { normalizeName, tokenize } from './sponsor-core.mjs';
+import { normalizeName, tokenize, parseCsvLine, parseRegisterCsv } from './sponsor-core.mjs';
 
 const results = [];
 const check = (name, fn) => {
@@ -24,6 +24,26 @@ function selfTest() {
     eqArr(tokenize('Jane Street Europe Limited'), ['jane', 'street'], 'tokens'));
   check('tokenize retombe sur les tokens bruts si tout est suffixe', () =>
     eqArr(tokenize('Services Limited'), ['services', 'limited'], 'fallback'));
+  check('parseCsvLine gere un champ entre guillemets avec virgule', () =>
+    eqArr(parseCsvLine('MARGARET ROAD STORES LTD,"HAMILTON, ",,Worker (A rating),Skilled Worker'),
+      ['MARGARET ROAD STORES LTD', 'HAMILTON,', '', 'Worker (A rating)', 'Skilled Worker'], 'csv'));
+  check('parseCsvLine gere une ligne sans guillemets', () =>
+    eqArr(parseCsvLine('Optiver UK Limited,London,,Worker (A rating),Skilled Worker'),
+      ['Optiver UK Limited', 'London', '', 'Worker (A rating)', 'Skilled Worker'], 'csv'));
+  check('parseCsvLine gere un guillemet double echappe', () =>
+    eqArr(parseCsvLine('A,"B ""quoted"" C",,D,E'), ['A', 'B "quoted" C', '', 'D', 'E'], 'csv'));
+  check('parseRegisterCsv saute l en-tete et structure les lignes', () => {
+    const rows = parseRegisterCsv([
+      'Organisation Name,Town/City,County,Type & Rating,Route',
+      ' DRW Investments (UK) Ltd,London,,Worker (A rating),Skilled Worker',
+      ' PhysicsX Limited ,London,,Worker (A rating),Skilled Worker',
+    ].join('\n'));
+    eq(rows.length, 2, 'nombre');
+    eq(rows[0].name, 'DRW Investments (UK) Ltd', 'nom trime');
+    eq(rows[1].route, 'Skilled Worker', 'route');
+  });
+  check('parseRegisterCsv ignore les lignes vides', () =>
+    eq(parseRegisterCsv('Organisation Name,Town/City,County,Type & Rating,Route\n\n\n').length, 0, 'vide'));
 
   for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.ok ? '' : ` — ${r.error}`}`);
   const failed = results.filter(r => !r.ok).length;
