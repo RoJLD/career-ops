@@ -66,3 +66,39 @@ export function detectStaleEvaluations(rows, { today, staleDays = 7, minScore = 
   }
   return findings;
 }
+
+const LIVENESS_LINE_RE = /^\S+\s+(active|expired|uncertain)\s+(?:\(api\)\s+)?(\S+)$/;
+
+/** Statuts par URL, lus depuis la sortie texte de check-liveness.mjs. */
+export function parseLivenessOutput(stdout) {
+  const map = new Map();
+  for (const line of String(stdout ?? '').split(/\r?\n/)) {
+    const m = line.trim().match(LIVENESS_LINE_RE);
+    if (m && m[2].startsWith('http')) map.set(m[2], m[1]);
+  }
+  return map;
+}
+
+/** Offres non candidatées dont l'annonce est explicitement expirée. */
+export function detectDeadPostings(rows, livenessByUrl, urlByReport) {
+  const findings = [];
+  for (const r of rows) {
+    if (r.status !== 'Evaluated') continue;
+    const report = reportNumberFromCell(r.report);
+    if (!report) continue;
+    const url = urlByReport.get(report);
+    if (!url) continue;
+    if (livenessByUrl.get(url) !== 'expired') continue;
+    findings.push({
+      type: 'dead', report, company: r.company,
+      detail: `${r.company} — l'annonce n'est plus en ligne`,
+    });
+  }
+  return findings;
+}
+
+/** Un constat `dead` rend le `stale` du même rapport sans objet. */
+export function suppressRedundant(findings) {
+  const dead = new Set(findings.filter(f => f.type === 'dead').map(f => f.report));
+  return findings.filter(f => !(f.type === 'stale' && dead.has(f.report)));
+}

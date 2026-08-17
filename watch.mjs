@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { pathToFileURL } from 'url';
 import { hasFlag } from './lib/cli-flags.mjs';
-import { findingKey, parseInboxPending, filterAlreadyQueued, detectStaleEvaluations } from './watch-core.mjs';
+import { findingKey, parseInboxPending, filterAlreadyQueued, detectStaleEvaluations, parseLivenessOutput, detectDeadPostings, suppressRedundant } from './watch-core.mjs';
 
 const results = [];
 const check = (name, fn) => {
@@ -58,6 +58,42 @@ function selfTest() {
     for (const st of ['Applied', 'Rejected', 'Discarded', 'SKIP', 'Hired']) {
       eq(detectStaleEvaluations([row({ status: st })], OPTS).length, 0, `état ${st}`);
     }
+  });
+
+  const LIVENESS_STDOUT = [
+    'Checking 2 URL(s)... (headed fallback on challenge)',
+    '',
+    '✅ active     (api) https://boards.example.com/a',
+    '❌ expired          https://boards.example.com/b',
+    '           posting removed',
+    '',
+    'Results: 1 active  1 expired  0 uncertain  (1 via API, no browser)',
+  ].join('\n');
+
+  check('parseLivenessOutput lit statut et URL', () => {
+    const m = parseLivenessOutput(LIVENESS_STDOUT);
+    eq(m.get('https://boards.example.com/a'), 'active', 'a');
+    eq(m.get('https://boards.example.com/b'), 'expired', 'b');
+    eq(m.size, 2, 'taille');
+  });
+
+  check('dead est émis sur expired', () => {
+    const rows = [row({ report: '[014](../reports/014-drw-2026-08-06.md)', company: 'DRW' })];
+    const f = detectDeadPostings(rows, new Map([['u14', 'expired']]), new Map([['014', 'u14']]));
+    eq(f.length, 1, 'nombre'); eq(f[0].type, 'dead', 'type');
+  });
+
+  check('dead n_est jamais émis sur uncertain', () => {
+    const rows = [row({ report: '[014](../reports/014-drw-2026-08-06.md)' })];
+    eq(detectDeadPostings(rows, new Map([['u14', 'uncertain']]), new Map([['014', 'u14']])).length, 0, 'nombre');
+  });
+
+  check('dead supprime stale sur la même ligne', () => {
+    const out = suppressRedundant([
+      { type: 'stale', report: '014', company: 'DRW', detail: 's' },
+      { type: 'dead', report: '014', company: 'DRW', detail: 'd' },
+    ]);
+    eq(out.length, 1, 'nombre'); eq(out[0].type, 'dead', 'dead gagne');
   });
 
   for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.ok ? '' : ` — ${r.error}`}`);
