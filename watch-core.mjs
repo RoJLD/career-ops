@@ -102,3 +102,28 @@ export function suppressRedundant(findings) {
   const dead = new Set(findings.filter(f => f.type === 'dead').map(f => f.report));
   return findings.filter(f => !(f.type === 'stale' && dead.has(f.report)));
 }
+
+const ACTIONABLE_URGENCY = new Set(['overdue', 'urgent']);
+
+/** Numéro de rapport zéro-padé depuis un chemin `reports/NNN-slug-date.md`. */
+export function reportNumberFromPath(path) {
+  const m = String(path ?? '').match(/(?:^|[/\\])(\d+)-/);
+  return m ? m[1].padStart(3, '0') : null;
+}
+
+/** Relances dues, d'après la sortie de followup-cadence.mjs. */
+export function detectFollowupsDue(cadenceEntries) {
+  const findings = [];
+  for (const e of cadenceEntries ?? []) {
+    if (!ACTIONABLE_URGENCY.has(e.urgency)) continue;
+    const report = reportNumberFromPath(e.reportPath);
+    if (!report) continue;
+    const late = typeof e.daysUntilNext === 'number' && e.daysUntilNext < 0
+      ? ` depuis ${Math.abs(e.daysUntilNext)} j` : '';
+    findings.push({
+      type: 'followup', report, company: e.company,
+      detail: `${e.company} (${e.status}) — relance due${late}`,
+    });
+  }
+  return findings;
+}

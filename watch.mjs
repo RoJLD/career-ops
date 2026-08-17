@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { pathToFileURL } from 'url';
 import { hasFlag } from './lib/cli-flags.mjs';
-import { findingKey, parseInboxPending, filterAlreadyQueued, detectStaleEvaluations, parseLivenessOutput, detectDeadPostings, suppressRedundant } from './watch-core.mjs';
+import { findingKey, parseInboxPending, filterAlreadyQueued, detectStaleEvaluations, parseLivenessOutput, detectDeadPostings, suppressRedundant, detectFollowupsDue } from './watch-core.mjs';
 
 const results = [];
 const check = (name, fn) => {
@@ -95,6 +95,23 @@ function selfTest() {
     ]);
     eq(out.length, 1, 'nombre'); eq(out[0].type, 'dead', 'dead gagne');
   });
+
+  const entry = (over = {}) => ({
+    num: 7, company: 'IMC', role: 'Graduate QR', status: 'Applied',
+    urgency: 'overdue', reportPath: 'reports/007-imc-2026-08-06.md', daysUntilNext: -3, ...over,
+  });
+
+  check('followup retient overdue et urgent', () => {
+    const f = detectFollowupsDue([entry(), entry({ urgency: 'urgent', num: 8 })]);
+    eq(f.length, 2, 'nombre'); eq(f[0].type, 'followup', 'type');
+  });
+  check('followup ignore waiting, cold et retired', () => {
+    for (const u of ['waiting', 'cold', 'retired']) {
+      eq(detectFollowupsDue([entry({ urgency: u })]).length, 0, `urgence ${u}`);
+    }
+  });
+  check('followup tire le numéro de rapport du reportPath', () =>
+    eq(detectFollowupsDue([entry()])[0].report, '007', 'rapport'));
 
   for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.ok ? '' : ` — ${r.error}`}`);
   const failed = results.filter(r => !r.ok).length;
