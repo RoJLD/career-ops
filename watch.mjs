@@ -119,6 +119,31 @@ function selfTest() {
     eq(m.size, 2, 'taille');
   });
 
+  const MIXED_LIVENESS_STDOUT = [
+    'Checking 3 URL(s)... (headed fallback on challenge)',
+    '',
+    '✅ active     (api) https://boards.example.com/a',
+    '❌ expired          https://boards.example.com/b',
+    '           posting removed',
+    '⚠️ uncertain        https://boards.example.com/c',
+    '           content present but no visible apply control found',
+    '',
+    'Results: 1 active  1 expired  1 uncertain  (1 via API, no browser)',
+  ].join('\n');
+
+  // Régression : un lot mixte (le cas réel — une seule URL incertaine sur vingt
+  // faisait autrefois échouer check-liveness.mjs avec exit non-zéro, et le
+  // catch de runLiveness jetait tout err.stdout, effaçant même les statuts
+  // actifs/expirés lus sans problème). La ligne `Results:` ne doit produire
+  // aucune 4e entrée.
+  check('parseLivenessOutput lit un lot mixte actif/expiré/incertain, Results ignorée', () => {
+    const m = parseLivenessOutput(MIXED_LIVENESS_STDOUT);
+    eq(m.get('https://boards.example.com/a'), 'active', 'a');
+    eq(m.get('https://boards.example.com/b'), 'expired', 'b');
+    eq(m.get('https://boards.example.com/c'), 'uncertain', 'c');
+    eq(m.size, 3, 'aucune entrée fantôme depuis la ligne Results');
+  });
+
   check('dead est émis sur expired', () => {
     const rows = [row({ report: '[014](../reports/014-drw-2026-08-06.md)', company: 'DRW' })];
     const f = detectDeadPostings(rows, new Map([['u14', 'expired']]), new Map([['014', 'u14']]));
@@ -198,22 +223,32 @@ function buildUrlByReport(reports) {
   return map;
 }
 
-/** Vivacité via check-liveness.mjs. Toute anomalie -> tout `uncertain`, jamais `dead`. */
+/**
+ * Vivacité via check-liveness.mjs. check-liveness.mjs exits non-zero as soon
+ * as ONE url is `expired`/`uncertain` — a routine outcome, not a broken run —
+ * so a thrown error's `err.stdout` is parsed exactly like a clean exit's
+ * stdout. Only stdout that yields nothing parseable (subprocess missing,
+ * timeout, output the parser doesn't recognise) falls back to "everything
+ * uncertain"; a `dead` finding still requires an explicit `expired` status.
+ */
 function runLiveness(urls) {
   if (!urls.length) return new Map();
+  let stdout = '';
+  let thrown = null;
   try {
-    const stdout = execFileSync('node', ['check-liveness.mjs', ...urls],
+    stdout = execFileSync('node', ['check-liveness.mjs', ...urls],
       { cwd: CAREER_OPS, encoding: 'utf8', timeout: 300000 });
-    const parsed = parseLivenessOutput(stdout);
-    if (parsed.size === 0) {
-      console.error('watch: sortie de check-liveness non reconnue — tout traité comme uncertain');
-      return new Map();
-    }
-    return parsed;
   } catch (err) {
-    console.error(`watch: vérification de vivacité impossible (${err.message}) — tout traité comme uncertain`);
+    thrown = err;
+    stdout = err.stdout != null ? String(err.stdout) : '';
+  }
+  const parsed = parseLivenessOutput(stdout);
+  if (parsed.size === 0) {
+    const reason = thrown ? ` (${thrown.message})` : '';
+    console.error(`watch: sortie de check-liveness non reconnue${reason} — tout traité comme uncertain`);
     return new Map();
   }
+  return parsed;
 }
 
 const TODAY = () => new Date().toISOString().slice(0, 10);
