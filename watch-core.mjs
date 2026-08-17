@@ -18,11 +18,20 @@ export function parseInboxPending(markdown) {
     .map(line => line.trim());
 }
 
-/** Constats dont la clé n'est pas déjà pendante. */
+/**
+ * Constats dont la clé n'est pas déjà pendante.
+ *
+ * `\d{3,}` (minimum trois chiffres, pas exactement trois) : `findingKey` ne
+ * fait que padStart(3, '0') sur `report`, donc un rapport ≥ 1000 émet une clé
+ * à 4 chiffres (`watch:stale:1024`). Une regex bornée à `\d{3}` ne la
+ * reconnaît jamais parmi les items pendants — le constat serait réinjecté à
+ * chaque run, indéfiniment et sans bruit. Le format émis par `findingKey`
+ * n'est pas modifié ; seul ce qui est reconnu en lecture s'élargit.
+ */
 export function filterAlreadyQueued(findings, pendingTexts) {
   const queued = new Set();
   for (const text of pendingTexts) {
-    const m = text.match(/\[(watch:[a-z]+:\d{3})\]/);
+    const m = text.match(/\[(watch:[a-z]+:\d{3,})\]/);
     if (m) queued.add(m[1]);
   }
   return findings.filter(f => !queued.has(findingKey(f)));
@@ -36,7 +45,20 @@ export function parseScoreCell(cell) {
   return m ? Number(m[1]) : null;
 }
 
-/** Numéro de rapport zéro-padé extrait d'une cellule Report, ou null. */
+/**
+ * Numéro de rapport zéro-padé extrait d'une cellule Report, ou null.
+ *
+ * Reste volontairement hand-rolled plutôt que de déléguer à
+ * `extractTrackerReportNumbers` (tracker-parse.mjs), qui est pourtant le
+ * helper canonique pour cette extraction et gère un cas que celui-ci rate
+ * (un chemin nu, sans lien markdown, y renvoie `null`). Vérification faite :
+ * tracker-parse.mjs charge `tracker-aliases.json` via `readFileSync` dans une
+ * IIFE au niveau module (voir `HEADER_ALIASES`) — donc un simple `import`
+ * déclenche un accès disque, ce que `watch-core.mjs` s'interdit par contrat
+ * (aucun I/O, jamais). L'importer romprait cette garantie pour tout
+ * consommateur de ce module, y compris les tests embarqués. D'où le choix de
+ * conserver cette version, signature et contrat inchangés.
+ */
 export function reportNumberFromCell(cell) {
   const m = String(cell ?? '').match(/\[(\d+)\]/);
   return m ? m[1].padStart(3, '0') : null;

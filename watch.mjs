@@ -83,6 +83,15 @@ function selfTest() {
     eq(fresh[0].type, 'dead', 'le résolu peut re-déclencher');
   });
 
+  check('filterAlreadyQueued reconnaît une clé à 4 chiffres (rapport ≥ 1000)', () => {
+    // findingKey ne fait que padStart(3, '0') — un rapport 1024 émet
+    // watch:stale:1024, jamais watch:stale:024. La regex de lecture doit
+    // accepter 3 chiffres OU PLUS, sinon ce constat est réinjecté chaque jour.
+    const pending = parseInboxPending('- [ ] 2026-08-17 09:30 — [watch:stale:1024] Qube dort');
+    const fresh = filterAlreadyQueued([{ type: 'stale', report: '1024' }], pending);
+    eq(fresh.length, 0, 'déjà pendant, donc écarté');
+  });
+
   check('stale signale une évaluation ancienne au-dessus du seuil', () => {
     const f = detectStaleEvaluations([row()], OPTS);
     eq(f.length, 1, 'nombre'); eq(f[0].report, '005', 'rapport'); eq(f[0].type, 'stale', 'type');
@@ -91,6 +100,19 @@ function selfTest() {
     eq(detectStaleEvaluations([row({ date: '2026-08-15' })], OPTS).length, 0, 'nombre'));
   check('stale ignore un score sous le seuil', () =>
     eq(detectStaleEvaluations([row({ score: '3.9/5' })], OPTS).length, 0, 'nombre'));
+  // Bornes exactes : sur les données réelles de l'utilisateur, 3 des 4 lignes
+  // stale sont à un score de PILE 4.0/5. Un flip accidentel de `<` en `<=`
+  // (côté âge) ou `<` en `>` (côté score) supprimerait la quasi-totalité de
+  // la fonctionnalité en silence — d'où ces deux tests de bornes séparés des
+  // cas généraux ci-dessus.
+  check('stale n_écarte PAS une évaluation dont l_âge est exactement au seuil', () => {
+    // today = 2026-08-17, staleDays = 7 → date = 2026-08-10 donne age === 7.
+    eq(detectStaleEvaluations([row({ date: '2026-08-10' })], OPTS).length, 0, 'nombre');
+  });
+  check('stale signale une évaluation dont le score est exactement au seuil', () => {
+    const f = detectStaleEvaluations([row({ score: '4.0/5' })], OPTS);
+    eq(f.length, 1, 'nombre');
+  });
   check('stale ignore les scores sentinelles', () => {
     for (const s of ['N/A', '—', '-']) {
       eq(detectStaleEvaluations([row({ score: s })], OPTS).length, 0, `sentinelle ${s}`);
@@ -212,15 +234,26 @@ function selfTest() {
   return failed === 0 ? 0 : 1;
 }
 
-/** URL de chaque rapport, lue dans son en-tête. Rapport absent ou sans URL -> ignoré. */
+/**
+ * URL de chaque rapport, lue dans son en-tête.
+ *
+ * Un rapport sans fichier sur disque ou sans en-tête `**URL:**` est ignoré —
+ * c'est la conservatisme voulu du §6 du design (mieux vaut rater un constat
+ * `dead` que d'en inventer un). Mais silencieux, cet abandon est dangereux :
+ * si les en-têtes URL régressent un jour, la détection `dead` retombe à zéro
+ * constat sans que rien ne le signale. `skipped` porte donc les numéros de
+ * rapport écartés ici, pour que l'appelant les compte et les affiche.
+ */
 function buildUrlByReport(reports) {
   const map = new Map();
+  const skipped = [];
   for (const { report, path } of reports) {
-    if (!existsSync(path)) continue;
+    if (!existsSync(path)) { skipped.push(report); continue; }
     const m = readFileSync(path, 'utf8').match(URL_HEADER_RE);
     if (m) map.set(report, m[1]);
+    else skipped.push(report);
   }
-  return map;
+  return { map, skipped };
 }
 
 /**
@@ -288,17 +321,25 @@ function main(argv) {
   // Un nom de rapport porte un slug et une date (005-qube-2026-08-06.md) :
   // on le résout par préfixe plutôt qu'en le reconstruisant.
   const reportFiles = readdirSync(join(CAREER_OPS, 'reports')).filter(f => f.endsWith('.md'));
-  const resolved = rows
+  const evaluatedReportNumbers = rows
     .filter(r => r.status === 'Evaluated')
     .map(r => reportNumberFromCell(r.report))
-    .filter(Boolean)
-    .map(report => {
-      const file = reportFiles.find(f => f.startsWith(`${report}-`));
-      return file ? { report, path: join(CAREER_OPS, 'reports', file) } : null;
-    })
     .filter(Boolean);
 
-  const urlByReport = buildUrlByReport(resolved);
+  // Deux façons distinctes de perdre un rapport avant même de tenter la
+  // vivacité : le fichier n'existe pas sur disque, ou (une fois lu) il n'a
+  // pas d'en-tête **URL:**. Les deux sont comptées ensemble (spec §6) : dans
+  // les deux cas la ligne devient invisible pour `dead` sans qu'on le sache.
+  const missingOnDisk = [];
+  const resolved = [];
+  for (const report of evaluatedReportNumbers) {
+    const file = reportFiles.find(f => f.startsWith(`${report}-`));
+    if (file) resolved.push({ report, path: join(CAREER_OPS, 'reports', file) });
+    else missingOnDisk.push(report);
+  }
+
+  const { map: urlByReport, skipped: missingUrlHeader } = buildUrlByReport(resolved);
+  const skippedReports = [...missingOnDisk, ...missingUrlHeader].sort();
   const livenessByUrl = runLiveness([...urlByReport.values()]);
 
   const followupsPath = join(CAREER_OPS, 'data', 'follow-ups.md');
@@ -319,9 +360,16 @@ function main(argv) {
   let added = 0, failed = 0;
   if (!dryRun) for (const f of findings) { if (queueFinding(f)) added++; else failed++; }
 
-  const result = { checked: rows.length, liveness: livenessByUrl.size, findings, added, dryRun };
+  const result = {
+    checked: rows.length, liveness: livenessByUrl.size, findings, added, dryRun,
+    skippedForUrl: skippedReports.length,
+    skippedForUrlReports: skippedReports,
+  };
   if (hasFlag(args, '--summary')) {
     console.log(`Tracker : ${result.checked} lignes · vivacité : ${result.liveness} vérifiées`);
+    if (skippedReports.length) {
+      console.log(`Ignorés faute d'URL résolvable : ${skippedReports.length} rapport(s) (${skippedReports.join(', ')})`);
+    }
     if (!findings.length) console.log('Aucun constat nouveau.');
     for (const f of findings) console.log(`  [${findingKey(f)}] ${f.detail}`);
     console.log(dryRun ? '\n(dry-run — rien écrit)' : `\n${added} item(s) ajouté(s) à l'inbox.`);
