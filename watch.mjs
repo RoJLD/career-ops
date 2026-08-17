@@ -1,0 +1,51 @@
+#!/usr/bin/env node
+import { pathToFileURL } from 'url';
+import { hasFlag } from './lib/cli-flags.mjs';
+import { findingKey, parseInboxPending, filterAlreadyQueued } from './watch-core.mjs';
+
+const results = [];
+const check = (name, fn) => {
+  try { fn(); results.push({ name, ok: true }); }
+  catch (err) { results.push({ name, ok: false, error: err.message }); }
+};
+const eq = (a, b, label) => { if (a !== b) throw new Error(`${label}: attendu ${b}, obtenu ${a}`); };
+
+function selfTest() {
+  check('findingKey encode type et rapport', () =>
+    eq(findingKey({ type: 'stale', report: '005' }), 'watch:stale:005', 'key'));
+
+  check('parseInboxPending ne retient que les items non cochés', () => {
+    const md = [
+      '- [ ] 2026-08-17 09:30 — [watch:stale:005] Qube dort',
+      '- [x] 2026-08-16 18:05 — [watch:dead:014] DRW → result: retiré',
+    ].join('\n');
+    const pending = parseInboxPending(md);
+    eq(pending.length, 1, 'nombre');
+    eq(pending[0].includes('[watch:stale:005]'), true, 'contenu');
+  });
+
+  check('filterAlreadyQueued écarte une clé pendante, laisse passer une résolue', () => {
+    const md = '- [ ] 2026-08-17 09:30 — [watch:stale:005] Qube dort\n- [x] 2026-08-16 18:05 — [watch:dead:014] DRW';
+    const pending = parseInboxPending(md);
+    const fresh = filterAlreadyQueued(
+      [{ type: 'stale', report: '005' }, { type: 'dead', report: '014' }],
+      pending
+    );
+    eq(fresh.length, 1, 'un seul nouveau');
+    eq(fresh[0].type, 'dead', 'le résolu peut re-déclencher');
+  });
+
+  for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.ok ? '' : ` — ${r.error}`}`);
+  const failed = results.filter(r => !r.ok).length;
+  console.log(`\n${results.length - failed}/${results.length} passés`);
+  return failed === 0 ? 0 : 1;
+}
+
+function main(argv) {
+  const args = argv.slice(2);
+  if (hasFlag(args, '--self-test')) return selfTest();
+  console.log('watch: pas encore implémenté');
+  return 0;
+}
+
+if (import.meta.url === pathToFileURL(process.argv[1]).href) process.exit(main(process.argv));
