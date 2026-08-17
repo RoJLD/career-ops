@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { pathToFileURL } from 'url';
 import { hasFlag } from './lib/cli-flags.mjs';
-import { normalizeName, tokenize, parseCsvLine, parseRegisterCsv } from './sponsor-core.mjs';
+import { normalizeName, tokenize, parseCsvLine, parseRegisterCsv, matchEntities, classifySponsorship } from './sponsor-core.mjs';
 
 const results = [];
 const check = (name, fn) => {
@@ -44,6 +44,41 @@ function selfTest() {
   });
   check('parseRegisterCsv ignore les lignes vides', () =>
     eq(parseRegisterCsv('Organisation Name,Town/City,County,Type & Rating,Route\n\n\n').length, 0, 'vide'));
+
+  const REG = parseRegisterCsv([
+    'Organisation Name,Town/City,County,Type & Rating,Route',
+    'DRW Investments (UK) Ltd,London,,Worker (A rating),Global Business Mobility: Senior or Specialist Worker',
+    'DRW Investments (UK) Ltd,London,,Worker (A rating),Skilled Worker',
+    'AshlotrimCare Ltd,Milton Keynes,Bedfordshire,Worker (A rating),Skilled Worker',
+    'CIMC Universal Tank Technologies (UK) Ltd,Skelmersdale,Lancashire,Worker (A rating),Skilled Worker',
+    'IMC London Limited,London,,Worker (A rating),Skilled Worker',
+    'IMC (UK) Learning Limited,London,,Worker (B rating),Skilled Worker',
+    'Qube Research & Technologies Limited,London,,Worker (A rating),Skilled Worker',
+  ].join('\n'));
+
+  check('matchEntities dedoublonne les routes d une meme entite', () => {
+    const m = matchEntities('DRW', REG);
+    eq(m.length, 1, 'une entite');
+    eq(m[0].routes.length, 2, 'deux routes');
+  });
+  check('matchEntities n apparie jamais une sous-chaine', () => {
+    const names = matchEntities('IMC', REG).map((e) => e.name);
+    eq(names.includes('AshlotrimCare Ltd'), false, 'AshlotrimCare exclu');
+    eq(names.includes('CIMC Universal Tank Technologies (UK) Ltd'), false, 'CIMC exclu');
+  });
+  check('classifySponsorship rend sponsor sur une entite unique', () => {
+    const r = classifySponsorship('Qube Research & Technologies', REG);
+    eq(r.status, 'sponsor', 'statut');
+    eq(r.entities[0].name, 'Qube Research & Technologies Limited', 'entite');
+  });
+  check('classifySponsorship rend ambiguous sur plusieurs entites', () =>
+    eq(classifySponsorship('IMC', REG).status, 'ambiguous', 'statut'));
+  check('classifySponsorship rend not-listed sans correspondance', () =>
+    eq(classifySponsorship('Pigment', REG).status, 'not-listed', 'statut'));
+  check('classifySponsorship marque les requetes courtes', () => {
+    eq(classifySponsorship('DRW', REG).shortQuery, true, 'DRW court');
+    eq(classifySponsorship('Qube Research & Technologies', REG).shortQuery, false, 'nom long');
+  });
 
   for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.ok ? '' : ` — ${r.error}`}`);
   const failed = results.filter(r => !r.ok).length;

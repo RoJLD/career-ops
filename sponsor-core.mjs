@@ -72,3 +72,43 @@ export function parseRegisterCsv(text) {
   }
   return rows;
 }
+
+/**
+ * Entités dont TOUS les tokens de la requête sont des tokens entiers.
+ * Les lignes d'une même entité sont fusionnées, leurs routes dédoublonnées.
+ */
+export function matchEntities(query, rows) {
+  const qt = tokenize(query);
+  if (!qt.length) return [];
+  const byName = new Map();
+  for (const row of rows) {
+    const rt = tokenize(row.name);
+    if (!qt.every((t) => rt.includes(t))) continue;
+    const existing = byName.get(row.name);
+    if (existing) {
+      if (row.route && !existing.routes.includes(row.route)) existing.routes.push(row.route);
+    } else {
+      byName.set(row.name, {
+        name: row.name, city: row.city, rating: row.rating,
+        routes: row.route ? [row.route] : [],
+      });
+    }
+  }
+  return [...byName.values()];
+}
+
+/** Une requête d'un seul token court est fragile — le consommateur doit le savoir. */
+function isShortQuery(query) {
+  const t = tokenize(query);
+  return t.length === 1 && t[0].length < 4;
+}
+
+/**
+ * Statut de sponsoring. `not-listed` signifie « inconnu », JAMAIS « non-sponsor » :
+ * l'entreprise peut recruter sans sponsoring ou être enregistrée sous un nom de groupe.
+ */
+export function classifySponsorship(query, rows) {
+  const entities = matchEntities(query, rows);
+  const status = entities.length === 0 ? 'not-listed' : entities.length === 1 ? 'sponsor' : 'ambiguous';
+  return { status, query, shortQuery: isShortQuery(query), entities };
+}
