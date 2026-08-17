@@ -27,3 +27,42 @@ export function filterAlreadyQueued(findings, pendingTexts) {
   }
   return findings.filter(f => !queued.has(findingKey(f)));
 }
+
+const SCORE_RE = /^(\d+(?:\.\d+)?)\/5$/;
+
+/** Score numérique d'une cellule, ou null pour une sentinelle (N/A, —, -). */
+export function parseScoreCell(cell) {
+  const m = String(cell ?? '').trim().match(SCORE_RE);
+  return m ? Number(m[1]) : null;
+}
+
+/** Numéro de rapport zéro-padé extrait d'une cellule Report, ou null. */
+export function reportNumberFromCell(cell) {
+  const m = String(cell ?? '').match(/\[(\d+)\]/);
+  return m ? m[1].padStart(3, '0') : null;
+}
+
+/** Jours entiers entre deux dates ISO (YYYY-MM-DD). */
+export function daysBetweenIso(fromIso, toIso) {
+  const ms = Date.parse(`${toIso}T00:00:00Z`) - Date.parse(`${fromIso}T00:00:00Z`);
+  return Math.floor(ms / 86400000);
+}
+
+/** Évaluations non candidatées, anciennes et au-dessus du seuil de score. */
+export function detectStaleEvaluations(rows, { today, staleDays = 7, minScore = 4.0 }) {
+  const findings = [];
+  for (const r of rows) {
+    if (r.status !== 'Evaluated') continue;
+    const score = parseScoreCell(r.score);
+    if (score === null || score < minScore) continue;
+    const report = reportNumberFromCell(r.report);
+    if (!report) continue;
+    const age = daysBetweenIso(r.date, today);
+    if (age <= staleDays) continue;
+    findings.push({
+      type: 'stale', report, company: r.company,
+      detail: `${r.company} ${score}/5, évaluée il y a ${age} j, jamais candidatée`,
+    });
+  }
+  return findings;
+}
