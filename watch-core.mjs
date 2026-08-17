@@ -127,3 +127,13 @@ export function detectFollowupsDue(cadenceEntries) {
   }
   return findings;
 }
+
+/** Assemble les trois détecteurs, supprime la redondance, puis déduplique. */
+export function collectFindings({ rows, livenessByUrl, urlByReport, cadenceEntries, pendingTexts, opts }) {
+  const all = [
+    ...detectDeadPostings(rows, livenessByUrl, urlByReport),
+    ...detectFollowupsDue(cadenceEntries),
+    ...detectStaleEvaluations(rows, opts),
+  ];
+  return filterAlreadyQueued(suppressRedundant(all), pendingTexts);
+}

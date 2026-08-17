@@ -1,7 +1,49 @@
 #!/usr/bin/env node
-import { pathToFileURL } from 'url';
+/**
+ * watch.mjs — pipeline watcher: surfaces work already paid for and going stale.
+ *
+ * Zero-token, scheduled check across three signals: job postings that died
+ * (via check-liveness.mjs), follow-ups that came due (via
+ * followup-cadence.mjs), and high-scoring evaluations left unapplied. Every
+ * finding is de-duplicated against what is already pending in the agent
+ * inbox, then appended there — the same inbox the AI assistant drains at the
+ * start of each session. See `.planning/watch-design.md` for the design.
+ *
+ * Design note: this script writes to ONE file, `data/agent-inbox.md`, and
+ * only through `agent-inbox.mjs add`. It never touches the tracker, never
+ * sends anything, never submits an application. A liveness check that fails,
+ * times out, or returns unrecognized output is treated as `uncertain` for
+ * every URL — a `dead` finding is only ever emitted on an explicit `expired`
+ * status, because a false "this posting is dead" makes the user abandon a
+ * live job opportunity.
+ *
+ * Run: node watch.mjs                  (check, write findings to the inbox, print JSON)
+ *      node watch.mjs --dry-run        (check, print JSON, write nothing)
+ *      node watch.mjs --summary        (human-readable output instead of JSON)
+ *      node watch.mjs --self-test
+ *      node watch.mjs --help
+ */
+import { pathToFileURL, fileURLToPath } from 'url';
+import { execFileSync } from 'child_process';
+import { readFileSync, existsSync, readdirSync } from 'fs';
+import { join, dirname } from 'path';
 import { hasFlag } from './lib/cli-flags.mjs';
-import { findingKey, parseInboxPending, filterAlreadyQueued, detectStaleEvaluations, parseLivenessOutput, detectDeadPostings, suppressRedundant, detectFollowupsDue } from './watch-core.mjs';
+import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
+import { analyzeFromContent } from './followup-cadence.mjs';
+import { findingKey, parseInboxPending, filterAlreadyQueued, detectStaleEvaluations, parseLivenessOutput, detectDeadPostings, suppressRedundant, detectFollowupsDue, reportNumberFromCell, collectFindings } from './watch-core.mjs';
+
+const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+const URL_HEADER_RE = /^\*\*URL:\*\*\s*(\S+)/m;
+
+const USAGE = `watch.mjs — pipeline watcher: dead postings, due follow-ups, stale evaluations
+
+Usage:
+  node watch.mjs                  Check, write findings to the agent inbox, print JSON
+  node watch.mjs --dry-run        Check, print JSON, write nothing
+  node watch.mjs --summary        Human-readable output instead of JSON
+  node watch.mjs --self-test      Run the embedded test suite
+  node watch.mjs --help           Show this help
+`;
 
 const results = [];
 const check = (name, fn) => {
@@ -113,17 +155,145 @@ function selfTest() {
   check('followup tire le numéro de rapport du reportPath', () =>
     eq(detectFollowupsDue([entry()])[0].report, '007', 'rapport'));
 
+  check('collectFindings assemble, supprime la redondance et déduplique', () => {
+    const rows = [
+      row(),                                                                    // 005 stale
+      row({ report: '[014](../reports/014-drw-2026-08-06.md)', company: 'DRW' }), // 014 dead
+    ];
+    const out = collectFindings({
+      rows,
+      livenessByUrl: new Map([['u14', 'expired']]),
+      urlByReport: new Map([['014', 'u14']]),
+      cadenceEntries: [],
+      pendingTexts: [],
+      opts: OPTS,
+    });
+    eq(out.length, 2, 'un stale + un dead');
+    eq(out.filter(f => f.type === 'stale' && f.report === '014').length, 0, 'stale 014 supprimé');
+  });
+
+  check('collectFindings écarte ce qui est déjà pendant', () => {
+    const out = collectFindings({
+      rows: [row()], livenessByUrl: new Map(), urlByReport: new Map(), cadenceEntries: [],
+      pendingTexts: ['- [ ] 2026-08-17 09:30 — [watch:stale:005] déjà signalé'],
+      opts: OPTS,
+    });
+    eq(out.length, 0, 'rien de neuf');
+  });
+
   for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.ok ? '' : ` — ${r.error}`}`);
   const failed = results.filter(r => !r.ok).length;
   console.log(`\n${results.length - failed}/${results.length} passés`);
   return failed === 0 ? 0 : 1;
 }
 
+/** URL de chaque rapport, lue dans son en-tête. Rapport absent ou sans URL -> ignoré. */
+function buildUrlByReport(reports) {
+  const map = new Map();
+  for (const { report, path } of reports) {
+    if (!existsSync(path)) continue;
+    const m = readFileSync(path, 'utf8').match(URL_HEADER_RE);
+    if (m) map.set(report, m[1]);
+  }
+  return map;
+}
+
+/** Vivacité via check-liveness.mjs. Toute anomalie -> tout `uncertain`, jamais `dead`. */
+function runLiveness(urls) {
+  if (!urls.length) return new Map();
+  try {
+    const stdout = execFileSync('node', ['check-liveness.mjs', ...urls],
+      { cwd: CAREER_OPS, encoding: 'utf8', timeout: 300000 });
+    const parsed = parseLivenessOutput(stdout);
+    if (parsed.size === 0) {
+      console.error('watch: sortie de check-liveness non reconnue — tout traité comme uncertain');
+      return new Map();
+    }
+    return parsed;
+  } catch (err) {
+    console.error(`watch: vérification de vivacité impossible (${err.message}) — tout traité comme uncertain`);
+    return new Map();
+  }
+}
+
+const TODAY = () => new Date().toISOString().slice(0, 10);
+
+/** Écrit un constat dans l'inbox. Échec = exit 1 : un constat perdu est pire qu'un run raté. */
+function queueFinding(finding) {
+  const text = `[${findingKey(finding)}] ${finding.detail}`;
+  try {
+    execFileSync('node', ['agent-inbox.mjs', 'add', text], { cwd: CAREER_OPS, encoding: 'utf8' });
+    return true;
+  } catch (err) {
+    console.error(`watch: écriture inbox impossible pour ${findingKey(finding)} — ${err.message}`);
+    return false;
+  }
+}
+
 function main(argv) {
   const args = argv.slice(2);
+  if (hasFlag(args, '--help')) { console.log(USAGE); return 0; }
   if (hasFlag(args, '--self-test')) return selfTest();
-  console.log('watch: pas encore implémenté');
-  return 0;
+
+  const appsPath = join(CAREER_OPS, 'data', 'applications.md');
+  if (!existsSync(appsPath)) { console.error(`watch: tracker introuvable (${appsPath})`); return 1; }
+  const trackerContent = readFileSync(appsPath, 'utf8');
+
+  let rows;
+  try {
+    const lines = trackerContent.split(/\r?\n/);
+    const colmap = resolveColumns(lines);
+    rows = lines.map(l => parseTrackerRow(l, colmap)).filter(Boolean);
+  } catch (err) {
+    console.error(`watch: tracker illisible — ${err.message}`);
+    return 1;
+  }
+  if (!rows.length) { console.error('watch: aucune ligne exploitable dans le tracker'); return 1; }
+
+  // Un nom de rapport porte un slug et une date (005-qube-2026-08-06.md) :
+  // on le résout par préfixe plutôt qu'en le reconstruisant.
+  const reportFiles = readdirSync(join(CAREER_OPS, 'reports')).filter(f => f.endsWith('.md'));
+  const resolved = rows
+    .filter(r => r.status === 'Evaluated')
+    .map(r => reportNumberFromCell(r.report))
+    .filter(Boolean)
+    .map(report => {
+      const file = reportFiles.find(f => f.startsWith(`${report}-`));
+      return file ? { report, path: join(CAREER_OPS, 'reports', file) } : null;
+    })
+    .filter(Boolean);
+
+  const urlByReport = buildUrlByReport(resolved);
+  const livenessByUrl = runLiveness([...urlByReport.values()]);
+
+  const followupsPath = join(CAREER_OPS, 'data', 'follow-ups.md');
+  const followupsContent = existsSync(followupsPath) ? readFileSync(followupsPath, 'utf8') : '';
+  const cadence = analyzeFromContent(trackerContent, followupsContent);
+
+  const inboxPath = join(CAREER_OPS, 'data', 'agent-inbox.md');
+  const pendingTexts = parseInboxPending(existsSync(inboxPath) ? readFileSync(inboxPath, 'utf8') : '');
+
+  const findings = collectFindings({
+    rows, livenessByUrl, urlByReport,
+    cadenceEntries: cadence.entries ?? [],
+    pendingTexts,
+    opts: { today: TODAY(), staleDays: 7, minScore: 4.0 },
+  });
+
+  const dryRun = hasFlag(args, '--dry-run');
+  let added = 0, failed = 0;
+  if (!dryRun) for (const f of findings) { if (queueFinding(f)) added++; else failed++; }
+
+  const result = { checked: rows.length, liveness: livenessByUrl.size, findings, added, dryRun };
+  if (hasFlag(args, '--summary')) {
+    console.log(`Tracker : ${result.checked} lignes · vivacité : ${result.liveness} vérifiées`);
+    if (!findings.length) console.log('Aucun constat nouveau.');
+    for (const f of findings) console.log(`  [${findingKey(f)}] ${f.detail}`);
+    console.log(dryRun ? '\n(dry-run — rien écrit)' : `\n${added} item(s) ajouté(s) à l'inbox.`);
+  } else {
+    console.log(JSON.stringify(result, null, 2));
+  }
+  return failed > 0 ? 1 : 0;
 }
 
 if (import.meta.url === pathToFileURL(process.argv[1]).href) process.exit(main(process.argv));
