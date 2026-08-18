@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { pathToFileURL } from 'url';
-import { hasFlag } from './lib/cli-flags.mjs';
+import { pathToFileURL, fileURLToPath } from 'url';
+import { spawnSync } from 'node:child_process';
+import { hasFlag, validateFlags } from './lib/cli-flags.mjs';
 import { normalizeName, tokenize, parseCsvLine, parseRegisterCsv, matchEntities, classifySponsorship, extractRegisterUrl, isStale } from './sponsor-core.mjs';
 
 const results = [];
@@ -66,6 +67,35 @@ function selfTest() {
     eq(names.includes('AshlotrimCare Ltd'), false, 'AshlotrimCare exclu');
     eq(names.includes('CIMC Universal Tank Technologies (UK) Ltd'), false, 'CIMC exclu');
   });
+  check('matchEntities collecte tous les ratings distincts d une entite (finding 2)', () => {
+    const rows = parseRegisterCsv([
+      'Organisation Name,Town/City,County,Type & Rating,Route',
+      'NETLIGHT CONSULTING LIMITED,London,,Worker (A rating),Skilled Worker',
+      'NETLIGHT CONSULTING LIMITED,London,,Worker (B rating),Skilled Worker',
+    ].join('\n'));
+    const m = matchEntities('NETLIGHT CONSULTING', rows);
+    eq(m.length, 1, 'une entite');
+    eqArr(m[0].ratings, ['Worker (A rating)', 'Worker (B rating)'], 'les deux ratings remontent, pas seulement le premier');
+  });
+  check('matchEntities fusionne deux lignes ne differant que par la casse/espacement (finding 3)', () => {
+    const rows = parseRegisterCsv([
+      'Organisation Name,Town/City,County,Type & Rating,Route',
+      '186 LONDON LIMITED,London,,Worker (A rating),Skilled Worker',
+      '186 London Limited,London,,Worker (A rating),Skilled Worker',
+    ].join('\n'));
+    const m = matchEntities('186 London', rows);
+    eq(m.length, 1, 'une seule entite malgre la casse differente, pas ambiguous a tort');
+  });
+  check('matchEntities collecte les villes distinctes plutot que d en perdre une (finding 3)', () => {
+    const rows = parseRegisterCsv([
+      'Organisation Name,Town/City,County,Type & Rating,Route',
+      '1ST CHOICE CABS LTD,London,,Worker (A rating),Skilled Worker',
+      '1st Choice Cabs Ltd,Ilford,,Worker (A rating),Skilled Worker',
+    ].join('\n'));
+    const m = matchEntities('1st Choice Cabs', rows);
+    eq(m.length, 1, 'une entite');
+    eqArr(m[0].cities, ['London', 'Ilford'], 'les deux villes sont conservees, aucune ecrasee silencieusement');
+  });
   check('classifySponsorship rend sponsor sur une entite unique', () => {
     const r = classifySponsorship('Qube Research & Technologies', REG);
     eq(r.status, 'sponsor', 'statut');
@@ -94,15 +124,47 @@ function selfTest() {
     eq(isStale('2026-08-15T00:00:00Z', '2026-08-17T00:00:00Z', 7), false, 'frais');
   });
 
+  // Finding 1 : un flag mal frappe (`-summary` pour `--summary`) ne doit
+  // JAMAIS devenir la requete — ce serait fabriquer un faux not-listed.
+  // Verifie via un vrai sous-processus CLI : validateFlags() appelle
+  // process.exit() elle-meme, donc ce chemin ne peut pas etre teste en
+  // appelant main() dans le processus du self-test. Aucun acces reseau :
+  // le rejet du flag inconnu se produit avant tout chargement du registre.
+  check('CLI rejette un flag inconnu au lieu de le prendre pour la requete (finding 1, #1633/#2743/#2744/#2775)', () => {
+    const self = fileURLToPath(import.meta.url);
+    const r = spawnSync(process.execPath, [self, '-summary', 'DRW'], { encoding: 'utf8', timeout: 15000 });
+    if (r.status === 0) throw new Error(`code de sortie attendu != 0, obtenu 0 — stdout: ${r.stdout}`);
+    if (/not-listed/.test(r.stdout)) {
+      throw new Error(`le flag mal frappe a produit un verdict not-listed au lieu d etre rejete : ${r.stdout}`);
+    }
+    if (!/flag/i.test(r.stderr) && !/flag/i.test(r.stdout)) {
+      throw new Error(`aucun message d erreur de flag inconnu trouve — stdout: ${r.stdout} stderr: ${r.stderr}`);
+    }
+  });
+
+  // Finding 6 : ecriture atomique du cache (fichier temporaire + rename),
+  // exercee ici sur un chemin scratch — jamais sur data/sponsor-register.csv.
+  check('writeFileAtomic ecrit le contenu final sans laisser de fichier temporaire (finding 6)', () => {
+    const scratch = join(tmpdir(), `sponsor-check-selftest-${process.pid}-${Date.now()}.csv`);
+    try {
+      writeFileAtomic(scratch, 'contenu de test');
+      eq(readFileSync(scratch, 'utf8'), 'contenu de test', 'contenu final');
+      const stray = readdirSync(dirname(scratch)).some((f) => f.startsWith(`${basename(scratch)}.tmp-`));
+      eq(stray, false, 'aucun fichier .tmp- residuel');
+    } finally {
+      if (existsSync(scratch)) unlinkSync(scratch);
+    }
+  });
+
   for (const r of results) console.log(`${r.ok ? 'ok  ' : 'FAIL'} ${r.name}${r.ok ? '' : ` — ${r.error}`}`);
   const failed = results.filter(r => !r.ok).length;
   console.log(`\n${results.length - failed}/${results.length} passés`);
   return failed === 0 ? 0 : 1;
 }
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, readdirSync, unlinkSync } from 'fs';
+import { join, dirname, basename } from 'path';
+import { tmpdir } from 'os';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 // Surchargeable par SPONSOR_PUBLICATION_URL — c'est ce qui rend le chemin
@@ -123,6 +185,23 @@ const USAGE = `Usage:
 Interroger avec le nom COMPLET : "Qube" rend 8 entites, "Qube Research & Technologies" en rend 1.
 Un statut not-listed signifie "inconnu", jamais "non-sponsor". Le script ne rejette aucune offre.`;
 
+// Un flag mal frappe (`-summary`, `--summry`) ne doit JAMAIS tomber dans la
+// requete : ce serait fabriquer un faux `not-listed` (finding 1, meme defaut
+// que #1633/#2743/#2744/#2775). validateFlags() rejette tout token inconnu
+// commencant par '-' avant qu'il ne soit pris pour un nom d'entreprise.
+const KNOWN_FLAGS = ['--summary', '--refresh', '--self-test', '--help', '-h'];
+
+/**
+ * Ecriture atomique : fichier temporaire dans le meme repertoire, puis
+ * renameSync par-dessus la cible. Sans cela, un lecteur concurrent du CSV de
+ * 11 Mo peut lire un fichier tronque pendant l'ecriture (finding 6).
+ */
+function writeFileAtomic(path, data) {
+  const tmp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(tmp, data, 'utf8');
+  renameSync(tmp, path);
+}
+
 /** Télécharge le registre courant et met à jour le cache. Renvoie le texte CSV. */
 async function refreshRegister() {
   const page = await fetch(PUBLICATION_URL);
@@ -133,10 +212,10 @@ async function refreshRegister() {
   if (!csv.ok) throw new Error(`CSV HTTP ${csv.status}`);
   const text = await csv.text();
   mkdirSync(dirname(CACHE_CSV), { recursive: true });
-  writeFileSync(CACHE_CSV, text, 'utf8');
-  writeFileSync(CACHE_META, JSON.stringify({
+  writeFileAtomic(CACHE_CSV, text);
+  writeFileAtomic(CACHE_META, JSON.stringify({
     fetchedAt: new Date().toISOString(), url, bytes: text.length,
-  }, null, 2), 'utf8');
+  }, null, 2));
   return text;
 }
 
@@ -164,10 +243,18 @@ async function loadRegister(force, nowIso) {
 
 async function main(argv) {
   const args = argv.slice(2);
-  if (hasFlag(args, '--help')) { console.log(USAGE); return 0; }
+  // Ordre impose par validateFlags : le flag inconnu est rejete AVANT tout
+  // traitement de --help/--self-test, et donc avant que le premier argument
+  // non-flag ne puisse etre pris pour la requete (finding 1). Sur flag
+  // inconnu ou --help, validateFlags imprime et appelle process.exit() elle-meme.
+  validateFlags(args, KNOWN_FLAGS, USAGE);
   if (hasFlag(args, '--self-test')) return selfTest();
 
-  const query = args.find((a) => !a.startsWith('--'));
+  // '-' (simple tiret), pas seulement '--' : un flag a un seul tiret est deja
+  // rejete plus haut par validateFlags s'il n'est pas connu, mais ce filtre
+  // reste la derniere ligne de defense pour qu'aucun token commencant par
+  // '-' ne devienne jamais la requete.
+  const query = args.find((a) => !a.startsWith('-'));
   if (!query || !query.trim()) { console.error(`sponsor-check: nom d'entreprise manquant\n\n${USAGE}`); return 1; }
 
   const nowIso = new Date().toISOString();
@@ -175,7 +262,9 @@ async function main(argv) {
   try {
     register = await loadRegister(hasFlag(args, '--refresh'), nowIso);
   } catch (err) {
-    const out = { status: 'unavailable', query, shortQuery: false, entities: [], reason: err.message };
+    // Meme forme que les trois autres statuts (finding 5) : un consommateur
+    // qui lit registerRows/staleDays sans garde ne doit jamais casser ici.
+    const out = { status: 'unavailable', query, shortQuery: false, entities: [], reason: err.message, registerRows: 0, staleDays: null };
     console.log(hasFlag(args, '--summary')
       ? `${query} : registre indisponible — ${err.message}`
       : JSON.stringify(out, null, 2));
@@ -189,7 +278,9 @@ async function main(argv) {
 
   console.log(`${query} → ${result.status}${result.shortQuery ? '  (requête courte, à pondérer)' : ''}`);
   for (const e of result.entities) {
-    console.log(`  ${e.name} — ${e.city || 'ville inconnue'} — ${e.rating}`);
+    const cityLabel = e.cities && e.cities.length > 1 ? e.cities.join(' / ') : (e.city || 'ville inconnue');
+    const ratingLabel = e.ratings && e.ratings.length ? e.ratings.join(' / ') : e.rating;
+    console.log(`  ${e.name} — ${cityLabel} — ${ratingLabel}`);
     for (const r of e.routes) console.log(`      route : ${r}`);
   }
   if (result.status === 'not-listed') console.log(`  Absent du registre. Cela veut dire "inconnu", pas "non-sponsor".`);

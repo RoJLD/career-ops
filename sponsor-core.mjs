@@ -76,25 +76,47 @@ export function parseRegisterCsv(text) {
 /**
  * Entités dont TOUS les tokens de la requête sont des tokens entiers.
  * Les lignes d'une même entité sont fusionnées, leurs routes dédoublonnées.
+ *
+ * Le regroupement se fait sur normalizeName(row.name), pas sur row.name brut :
+ * apparier sur des tokens normalisés puis regrouper sur la casse brute laissait
+ * des variantes de casse/espacement d'un même nom légal ressortir comme deux
+ * entités distinctes → `ambiguous` à tort (290 sociétés mesurées, finding 3).
+ * Le premier orthographe brut rencontré reste affiché.
+ *
+ * Deux lignes fusionnées peuvent légitimement porter des villes différentes
+ * (deux licences distinctes sous un nom quasi identique) : `cities` collecte
+ * toutes les villes distinctes plutôt que d'en écraser une silencieusement.
+ *
+ * `ratings` collecte de même tous les ratings distincts rencontrés (dans
+ * l'ordre) : garder seulement le premier masquait un rating B derrière un A
+ * pour la même entité (finding 2) — un rating B signale un sponsor sous plan
+ * d'action, c'est précisément ce que ce champ existe pour révéler.
  */
 export function matchEntities(query, rows) {
   const qt = tokenize(query);
   if (!qt.length) return [];
-  const byName = new Map();
+  const byKey = new Map();
   for (const row of rows) {
     const rt = tokenize(row.name);
     if (!qt.every((t) => rt.includes(t))) continue;
-    const existing = byName.get(row.name);
+    const key = normalizeName(row.name);
+    const existing = byKey.get(key);
     if (existing) {
       if (row.route && !existing.routes.includes(row.route)) existing.routes.push(row.route);
+      if (row.rating && !existing.ratings.includes(row.rating)) existing.ratings.push(row.rating);
+      if (row.city && !existing.cities.includes(row.city)) existing.cities.push(row.city);
     } else {
-      byName.set(row.name, {
-        name: row.name, city: row.city, rating: row.rating,
+      byKey.set(key, {
+        name: row.name,
+        city: row.city,
+        cities: row.city ? [row.city] : [],
+        rating: row.rating,
+        ratings: row.rating ? [row.rating] : [],
         routes: row.route ? [row.route] : [],
       });
     }
   }
-  return [...byName.values()];
+  return [...byKey.values()];
 }
 
 /** Une requête d'un seul token court est fragile — le consommateur doit le savoir. */
