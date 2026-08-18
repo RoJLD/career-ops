@@ -112,3 +112,25 @@ export function classifySponsorship(query, rows) {
   const status = entities.length === 0 ? 'not-listed' : entities.length === 1 ? 'sponsor' : 'ambiguous';
   return { status, query, shortQuery: isShortQuery(query), entities };
 }
+
+const REGISTER_URL_RE =
+  /https:\/\/assets\.publishing\.service\.gov\.uk\/media\/[a-z0-9]+\/[^"'\s]*Worker_and_Temporary_Worker_Web_Register[^"'\s]*\.csv/i;
+
+/**
+ * URL du CSV courant, extraite du HTML de la page de publication.
+ * Le lien porte une date et un hash : il change plusieurs fois par jour et ne
+ * doit jamais être codé en dur. Le marqueur de nom de fichier évite d'attraper
+ * un autre CSV présent sur la page.
+ */
+export function extractRegisterUrl(html) {
+  const m = String(html ?? '').match(REGISTER_URL_RE);
+  return m ? m[0] : null;
+}
+
+/** Vrai si `fetchedAt` précède `now` de plus de `maxAgeDays`. Dates ISO injectées. */
+export function isStale(fetchedAt, now, maxAgeDays) {
+  const a = Date.parse(fetchedAt);
+  const b = Date.parse(now);
+  if (Number.isNaN(a) || Number.isNaN(b)) return true;
+  return (b - a) / 86400000 > maxAgeDays;
+}
