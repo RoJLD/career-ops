@@ -1,0 +1,158 @@
+#!/usr/bin/env node
+/**
+ * sponsor-core.mjs — logique pure de résolution du sponsoring UK.
+ * Aucun I/O : pas de fs, pas de réseau, pas d'horloge.
+ * Voir .planning/sponsor-check-design.md
+ */
+
+/**
+ * Suffixes d'entité légale retirés avant appariement. Le tracker porte des
+ * marques ("DRW"), le registre des personnes morales ("DRW Investments (UK) Ltd").
+ */
+export const LEGAL_SUFFIXES = new Set([
+  'ltd', 'limited', 'llp', 'plc', 'uk', 'europe', 'group', 'holdings',
+  'services', 'investments', 'international', 'company', 'co', 'inc', 'llc',
+]);
+
+/** Minuscules, & -> and, ponctuation en espaces, espaces collapsés. */
+export function normalizeName(value) {
+  return String(value ?? '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+/**
+ * Tokens significatifs d'un nom. Si le retrait des suffixes vide la liste
+ * (« Services Limited »), on retombe sur les tokens bruts : un appariement
+ * trop strict vaut mieux qu'un appariement universel ou impossible.
+ */
+export function tokenize(value) {
+  const all = normalizeName(value).split(' ').filter(Boolean);
+  const kept = all.filter((t) => !LEGAL_SUFFIXES.has(t));
+  return kept.length ? kept : all;
+}
+
+/**
+ * Découpe une ligne CSV en respectant les guillemets. Le registre en contient
+ * (~2900 lignes sur 142 780) : un split(',') naïf y décale toutes les colonnes.
+ */
+export function parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; }
+      } else { cur += ch; }
+    } else if (ch === '"') {
+      inQuotes = true;
+    } else if (ch === ',') {
+      out.push(cur.trim()); cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+/** Lignes structurées du registre. L'en-tête est sauté, les vides ignorées. */
+export function parseRegisterCsv(text) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i].trim()) continue;
+    const c = parseCsvLine(lines[i]);
+    if (!c[0]) continue;
+    rows.push({ name: c[0], city: c[1] || '', county: c[2] || '', rating: c[3] || '', route: c[4] || '' });
+  }
+  return rows;
+}
+
+/**
+ * Entités dont TOUS les tokens de la requête sont des tokens entiers.
+ * Les lignes d'une même entité sont fusionnées, leurs routes dédoublonnées.
+ *
+ * Le regroupement se fait sur normalizeName(row.name), pas sur row.name brut :
+ * apparier sur des tokens normalisés puis regrouper sur la casse brute laissait
+ * des variantes de casse/espacement d'un même nom légal ressortir comme deux
+ * entités distinctes → `ambiguous` à tort (290 sociétés mesurées, finding 3).
+ * Le premier orthographe brut rencontré reste affiché.
+ *
+ * Deux lignes fusionnées peuvent légitimement porter des villes différentes
+ * (deux licences distinctes sous un nom quasi identique) : `cities` collecte
+ * toutes les villes distinctes plutôt que d'en écraser une silencieusement.
+ *
+ * `ratings` collecte de même tous les ratings distincts rencontrés (dans
+ * l'ordre) : garder seulement le premier masquait un rating B derrière un A
+ * pour la même entité (finding 2) — un rating B signale un sponsor sous plan
+ * d'action, c'est précisément ce que ce champ existe pour révéler.
+ */
+export function matchEntities(query, rows) {
+  const qt = tokenize(query);
+  if (!qt.length) return [];
+  const byKey = new Map();
+  for (const row of rows) {
+    const rt = tokenize(row.name);
+    if (!qt.every((t) => rt.includes(t))) continue;
+    const key = normalizeName(row.name);
+    const existing = byKey.get(key);
+    if (existing) {
+      if (row.route && !existing.routes.includes(row.route)) existing.routes.push(row.route);
+      if (row.rating && !existing.ratings.includes(row.rating)) existing.ratings.push(row.rating);
+      if (row.city && !existing.cities.includes(row.city)) existing.cities.push(row.city);
+    } else {
+      byKey.set(key, {
+        name: row.name,
+        city: row.city,
+        cities: row.city ? [row.city] : [],
+        rating: row.rating,
+        ratings: row.rating ? [row.rating] : [],
+        routes: row.route ? [row.route] : [],
+      });
+    }
+  }
+  return [...byKey.values()];
+}
+
+/** Une requête d'un seul token court est fragile — le consommateur doit le savoir. */
+function isShortQuery(query) {
+  const t = tokenize(query);
+  return t.length === 1 && t[0].length < 4;
+}
+
+/**
+ * Statut de sponsoring. `not-listed` signifie « inconnu », JAMAIS « non-sponsor » :
+ * l'entreprise peut recruter sans sponsoring ou être enregistrée sous un nom de groupe.
+ */
+export function classifySponsorship(query, rows) {
+  const entities = matchEntities(query, rows);
+  const status = entities.length === 0 ? 'not-listed' : entities.length === 1 ? 'sponsor' : 'ambiguous';
+  return { status, query, shortQuery: isShortQuery(query), entities };
+}
+
+const REGISTER_URL_RE =
+  /https:\/\/assets\.publishing\.service\.gov\.uk\/media\/[a-z0-9]+\/[^"'\s]*Worker_and_Temporary_Worker_Web_Register[^"'\s]*\.csv/i;
+
+/**
+ * URL du CSV courant, extraite du HTML de la page de publication.
+ * Le lien porte une date et un hash : il change plusieurs fois par jour et ne
+ * doit jamais être codé en dur. Le marqueur de nom de fichier évite d'attraper
+ * un autre CSV présent sur la page.
+ */
+export function extractRegisterUrl(html) {
+  const m = String(html ?? '').match(REGISTER_URL_RE);
+  return m ? m[0] : null;
+}
+
+/** Vrai si `fetchedAt` précède `now` de plus de `maxAgeDays`. Dates ISO injectées. */
+export function isStale(fetchedAt, now, maxAgeDays) {
+  const a = Date.parse(fetchedAt);
+  const b = Date.parse(now);
+  if (Number.isNaN(a) || Number.isNaN(b)) return true;
+  return (b - a) / 86400000 > maxAgeDays;
+}
