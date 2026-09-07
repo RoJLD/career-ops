@@ -272,6 +272,7 @@ const scripts = [
   { name: 'watch.mjs --self-test', expectExit: 0 },
   { name: 'sponsor-check.mjs --self-test', expectExit: 0 },
   { name: 'check-archetypes.mjs --self-test', expectExit: 0 },
+  { name: 'kpi.mjs --self-test', expectExit: 0 },
   { name: 'rank-pipeline.mjs --self-test', expectExit: 0 },
   { name: 'discover-ats.mjs --self-test', expectExit: 0 },
   { name: 'process-quality.mjs --self-test', expectExit: 0 },
