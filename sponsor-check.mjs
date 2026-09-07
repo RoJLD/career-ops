@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { pathToFileURL, fileURLToPath } from 'url';
+import { fileURLToPath } from 'url';
 import { spawnSync } from 'node:child_process';
 import { hasFlag, validateFlags } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
 import { normalizeName, tokenize, parseCsvLine, parseRegisterCsv, matchEntities, classifySponsorship, extractRegisterUrl, isStale } from './sponsor-core.mjs';
 
 const results = [];
@@ -165,14 +166,19 @@ function selfTest() {
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, readdirSync, unlinkSync } from 'fs';
 import { join, dirname, basename } from 'path';
 import { tmpdir } from 'os';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
-const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+// The register cache lives under the DATA root, not next to this script.
+// getCareerOpsRoot() resolves it from CAREER_OPS_ROOT / a .career-ops-data
+// marker / the code root; the two coincide by default and diverge the moment
+// the user points their data elsewhere.
+const DATA_ROOT = getCareerOpsRoot();
 // Surchargeable par SPONSOR_PUBLICATION_URL — c'est ce qui rend le chemin
 // d'echec testable a la main (Step 6b) sans couper le reseau de la machine.
 const PUBLICATION_URL = process.env.SPONSOR_PUBLICATION_URL
   || 'https://www.gov.uk/government/publications/register-of-licensed-sponsors-workers';
-const CACHE_CSV = join(CAREER_OPS, 'data', 'sponsor-register.csv');
-const CACHE_META = join(CAREER_OPS, 'data', 'sponsor-register.meta.json');
+const CACHE_CSV = join(DATA_ROOT, 'data', 'sponsor-register.csv');
+const CACHE_META = join(DATA_ROOT, 'data', 'sponsor-register.meta.json');
 const MAX_AGE_DAYS = 7;
 
 const USAGE = `Usage:
@@ -289,6 +295,6 @@ async function main(argv) {
   return 0;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   main(process.argv).then((code) => process.exit(code));
 }

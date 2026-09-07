@@ -35,9 +35,10 @@
 
 import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
 
 import { hasFlag, validateFlags } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 const KNOWN_FLAGS = ['--summary', '--suggest', '--strict', '--self-test', '--help', '-h'];
@@ -302,4 +303,4 @@ function main(argv) {
   return hasFlag(args, '--strict') && nonCanonical.length ? 1 : 0;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) process.exit(main(process.argv));
+if (isMainModule(import.meta.url)) process.exit(main(process.argv));

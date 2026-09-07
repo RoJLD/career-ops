@@ -22,9 +22,9 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import { computeTrackerStats, computeFunnel, computeScanStats } from './stats.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 import {
   parseReportSummary,
   computeKpis,
@@ -35,10 +35,16 @@ import {
   KPI_DEFS,
 } from './kpi-core.mjs';
 
-const ROOT = path.dirname(fileURLToPath(import.meta.url));
-const REPORTS_DIR = path.join(ROOT, 'reports');
-const TRACKER_PATH = path.join(ROOT, 'data', 'applications.md');
-const SCAN_HISTORY_PATH = path.join(ROOT, 'data', 'scan-history.tsv');
+// Every path below is user-layer, so all three resolve from the DATA root,
+// which getCareerOpsRoot() reads from CAREER_OPS_ROOT / a .career-ops-data
+// marker / the code root. Building them from the code root would silently
+// read an empty pipeline the moment the user moves their data elsewhere -
+// and an empty denominator is exactly what this board locks on, so the
+// board would report "not measurable yet" instead of failing loudly.
+const DATA_ROOT = getCareerOpsRoot();
+const REPORTS_DIR = path.join(DATA_ROOT, 'reports');
+const TRACKER_PATH = path.join(DATA_ROOT, 'data', 'applications.md');
+const SCAN_HISTORY_PATH = path.join(DATA_ROOT, 'data', 'scan-history.tsv');
 
 /** Read a file, or return '' when it is absent. Missing data is never an error here. */
 function readOr(filePath, fallback = '') {

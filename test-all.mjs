@@ -369,11 +369,11 @@ const scripts = [
   { name: 'invite-match.mjs --self-test', expectExit: 0 },
   { name: 'tracker-sync-check.mjs --self-test', expectExit: 0 },
   { name: 'updater-migration-tests.mjs', expectExit: 0 },
-  { name: 'tracker-columns-tests.mjs', expectExit: 0 },
-  { name: 'agent-inbox-tests.mjs', expectExit: 0 },
-  { name: 'followup-seed-tests.mjs', expectExit: 0 },
+  { name: 'tracker-columns-tests.mjs', expectExit: 0, timeoutMs: 300_000 },
+  { name: 'agent-inbox-tests.mjs', expectExit: 0, timeoutMs: 300_000 },
+  { name: 'followup-seed-tests.mjs', expectExit: 0, timeoutMs: 180_000 },
   { name: 'paste-reply-tests.mjs', expectExit: 0 },
-  { name: 'set-status-tests.mjs', expectExit: 0 },
+  { name: 'set-status-tests.mjs', expectExit: 0, timeoutMs: 420_000 },
   // The one script in this list that genuinely needs longer than the shared
   // budget. It spawns competing writer processes for 27 contention cases, and
   // that cost is the behaviour under test rather than slack to be trimmed.

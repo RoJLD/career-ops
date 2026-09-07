@@ -23,16 +23,24 @@
  *      node watch.mjs --self-test
  *      node watch.mjs --help
  */
-import { pathToFileURL, fileURLToPath } from 'url';
+import { fileURLToPath } from 'url';
 import { execFileSync } from 'child_process';
 import { readFileSync, existsSync, readdirSync } from 'fs';
 import { join, dirname } from 'path';
 import { hasFlag } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
 import { resolveColumns, parseTrackerRow } from './tracker-parse.mjs';
 import { analyzeFromContent } from './followup-cadence.mjs';
 import { findingKey, parseInboxPending, filterAlreadyQueued, detectStaleEvaluations, parseLivenessOutput, detectDeadPostings, suppressRedundant, detectFollowupsDue, reportNumberFromCell, collectFindings } from './watch-core.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
+// CAREER_OPS is the CODE root: it resolves sibling scripts and is the cwd we
+// spawn them from. DATA_ROOT is the DATA root, which getCareerOpsRoot()
+// resolves from CAREER_OPS_ROOT / a .career-ops-data marker / the code root.
+// They coincide by default and diverge the moment data lives elsewhere, so a
+// user-layer path must never be built from CAREER_OPS.
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+const DATA_ROOT = getCareerOpsRoot();
 const URL_HEADER_RE = /^\*\*URL:\*\*\s*(\S+)/m;
 
 const USAGE = `watch.mjs — pipeline watcher: dead postings, due follow-ups, stale evaluations
@@ -303,7 +311,7 @@ function main(argv) {
   if (hasFlag(args, '--help')) { console.log(USAGE); return 0; }
   if (hasFlag(args, '--self-test')) return selfTest();
 
-  const appsPath = join(CAREER_OPS, 'data', 'applications.md');
+  const appsPath = join(DATA_ROOT, 'data', 'applications.md');
   if (!existsSync(appsPath)) { console.error(`watch: tracker introuvable (${appsPath})`); return 1; }
   const trackerContent = readFileSync(appsPath, 'utf8');
 
@@ -320,7 +328,7 @@ function main(argv) {
 
   // Un nom de rapport porte un slug et une date (005-qube-2026-08-06.md) :
   // on le résout par préfixe plutôt qu'en le reconstruisant.
-  const reportFiles = readdirSync(join(CAREER_OPS, 'reports')).filter(f => f.endsWith('.md'));
+  const reportFiles = readdirSync(join(DATA_ROOT, 'reports')).filter(f => f.endsWith('.md'));
   const evaluatedReportNumbers = rows
     .filter(r => r.status === 'Evaluated')
     .map(r => reportNumberFromCell(r.report))
@@ -334,7 +342,7 @@ function main(argv) {
   const resolved = [];
   for (const report of evaluatedReportNumbers) {
     const file = reportFiles.find(f => f.startsWith(`${report}-`));
-    if (file) resolved.push({ report, path: join(CAREER_OPS, 'reports', file) });
+    if (file) resolved.push({ report, path: join(DATA_ROOT, 'reports', file) });
     else missingOnDisk.push(report);
   }
 
@@ -342,11 +350,11 @@ function main(argv) {
   const skippedReports = [...missingOnDisk, ...missingUrlHeader].sort();
   const livenessByUrl = runLiveness([...urlByReport.values()]);
 
-  const followupsPath = join(CAREER_OPS, 'data', 'follow-ups.md');
+  const followupsPath = join(DATA_ROOT, 'data', 'follow-ups.md');
   const followupsContent = existsSync(followupsPath) ? readFileSync(followupsPath, 'utf8') : '';
   const cadence = analyzeFromContent(trackerContent, followupsContent);
 
-  const inboxPath = join(CAREER_OPS, 'data', 'agent-inbox.md');
+  const inboxPath = join(DATA_ROOT, 'data', 'agent-inbox.md');
   const pendingTexts = parseInboxPending(existsSync(inboxPath) ? readFileSync(inboxPath, 'utf8') : '');
 
   const findings = collectFindings({
@@ -379,4 +387,4 @@ function main(argv) {
   return failed > 0 ? 1 : 0;
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) process.exit(main(process.argv));
+if (isMainModule(import.meta.url)) process.exit(main(process.argv));

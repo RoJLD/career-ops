@@ -40,10 +40,11 @@
 
 import { existsSync, mkdirSync, readdirSync, renameSync, statSync, writeFileSync, rmSync } from 'fs';
 import { join, dirname, basename, relative } from 'path';
-import { fileURLToPath, pathToFileURL } from 'url';
+import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 
 import { flagValue, hasFlag } from './lib/cli-flags.mjs';
+import { isMainModule } from './lib/is-main-module.mjs';
 
 const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
 
@@ -276,6 +277,6 @@ function main(argv) {
   }
 }
 
-if (import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isMainModule(import.meta.url)) {
   process.exit(main(process.argv));
 }
