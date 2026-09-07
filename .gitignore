@@ -38,6 +38,13 @@ jds/*
 *学位*
 *成绩单*
 
+# The directory itself: intake drops master CVs, diplomas and references here.
+documents/*
+!documents/.gitkeep
+!documents/README.md
+# intake ledger: records which document fed which claim (user data).
+data/intake-state.json
+
 # Interview prep (accumulated STAR+R stories — user data)
 interview-prep/*
 !interview-prep/
@@ -80,13 +87,14 @@ plugins.lock
 
 # Generated
 .resolved-prompt-*
+.tmp-script-test-*/
 node_modules/
 bun.lock
 # Report-number reservation sentinels (ephemeral, created by reserve-report-num.mjs)
 reports/*-RESERVED.md
 
 # Backup files written by normalize-statuses.mjs / dedup-tracker.mjs
-*.bak
+*.bak*
 
 # OpenRouter runner — generated data (personal, never commit)
 data/model-blacklist.json
