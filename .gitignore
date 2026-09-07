@@ -127,10 +127,6 @@ plan/
 # Web — runtime cache/history the dashboard writes locally; nothing here is tracked.
 .career-ops-web/
 
-# Upgrade-test fixtures are fictional system-layer data, never user data
-# (see DATA_CONTRACT.md). Re-include them past the unanchored user-layer
-# patterns above (cv.md, portals.yml).
-!test-fixtures/**
 data/agent-inbox.md
 
 # Added by career-ops update-system.mjs.
@@ -193,3 +189,10 @@ follow-ups.md
 # personal server credentials (e.g. a plugin's API token) once a user adds
 # an MCP server, same risk class as .env.
 .mcp.json
+
+# Upgrade-test fixtures are fictional system-layer data, never user data
+# (see DATA_CONTRACT.md). Re-include them past the unanchored user-layer
+# patterns above (cv.md, portals.yml, applications.md, follow-ups.md).
+# MUST stay last: git honours the final matching pattern, and the updater
+# appends new rules to the end of this file.
+!test-fixtures/**
