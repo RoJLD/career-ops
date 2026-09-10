@@ -193,6 +193,10 @@ follow-ups.md
 # Upgrade-test fixtures are fictional system-layer data, never user data
 # (see DATA_CONTRACT.md). Re-include them past the unanchored user-layer
 # patterns above (cv.md, portals.yml, applications.md, follow-ups.md).
+# Send-lists and other personal job-search documents generated at the repo root.
+# Personal layer: tracked in the perso repo, never in the code repo (the fork is PUBLIC).
+ENVOI.md
+
 # MUST stay last: git honours the final matching pattern, and the updater
 # appends new rules to the end of this file.
 !test-fixtures/**
