@@ -11,29 +11,40 @@
  * cheaply and without an LLM, so a stray CV is caught in seconds instead of
  * being discovered months later next to twelve others.
  *
- * Three checks:
+ * Five checks:
  *   1. stray     — an offer deliverable sitting flat in output/ instead of in a bundle
  *   2. dangling  — a data/pdf-index.tsv row pointing at a file that no longer exists
- *   3. empty     — a version folder with no cv.pdf in it
+ *   3. misplaced — a deliverable loose in a COMPANY folder, outside any offer
+ *   4. empty     — a version folder with no cv.pdf in it
+ *   5. legacy    — a bundle still in the flat pre-grouping `output/{NNN}-{slug}/` shape
  *
  * Run: node check-bundles.mjs             (JSON to stdout)
  *      node check-bundles.mjs --summary   (human-readable report)
  *      node check-bundles.mjs --self-test
  *      node check-bundles.mjs --help
  *
- * Exit code is 1 when any stray or dangling finding is present, so it can gate
- * a commit or a batch run. `empty` findings are informational and do not fail.
+ * Exit code is 1 when a stray, dangling or misplaced finding is present, so it
+ * can gate a commit or a batch run. `empty` and `legacy` are informational.
+ *
+ * The directory walk is NOT reimplemented here — it comes from bundle.mjs's
+ * listBundles(). That matters: this checker's whole value is being right about
+ * the layout, and the previous version kept its own copy of the pattern. A
+ * checker that silently stops recognising the shape it guards reports "clean"
+ * forever, which is worse than not running at all.
  */
 
 import { existsSync, readdirSync, readFileSync, statSync, mkdirSync, writeFileSync, rmSync } from 'fs';
 import { join, dirname } from 'path';
-import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 
 import { hasFlag } from './lib/cli-flags.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
+import { listBundles } from './bundle.mjs';
+import { getCareerOpsRoot, resolveTrackerPath } from './path-resolver.mjs';
+import { resolvePdfIndexPath } from './tracker-utils.mjs';
 
-const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+// The DATA root — see the same note in bundle.mjs.
+const CAREER_OPS = getCareerOpsRoot();
 
 const USAGE = `Usage:
   node check-bundles.mjs              # JSON findings to stdout
@@ -41,7 +52,7 @@ const USAGE = `Usage:
   node check-bundles.mjs --self-test  # run the in-memory test suite
   node check-bundles.mjs --help       # print this usage block and exit
 
-Exit 1 when a stray or dangling finding is present; 0 otherwise.`;
+Exit 1 when a stray, dangling or misplaced finding is present; 0 otherwise.`;
 
 /**
  * Files allowed to live flat in output/ because they belong to no single offer.
@@ -68,7 +79,7 @@ export function isAllowedFlat(name, allowlist = FLAT_ALLOWLIST) {
 /** Collect every finding. Root-injectable so the self-test needs no real project. */
 export function checkBundles(root = CAREER_OPS, { allowlist = FLAT_ALLOWLIST } = {}) {
   const outputDir = join(root, 'output');
-  const findings = { stray: [], dangling: [], empty: [] };
+  const findings = { stray: [], dangling: [], misplaced: [], empty: [], legacy: [] };
 
   // 1. Loose deliverables at the top level of output/.
   if (existsSync(outputDir)) {
@@ -82,7 +93,14 @@ export function checkBundles(root = CAREER_OPS, { allowlist = FLAT_ALLOWLIST } =
   }
 
   // 2. Manifest rows whose files have gone.
-  const indexPath = join(root, 'data', 'pdf-index.tsv');
+  //
+  // Resolved through the same pair generate-pdf.mjs and outcome.mjs use, so a
+  // CAREER_OPS_PDF_INDEX override points all three at one file. Hard-coding
+  // `join(root, 'data', 'pdf-index.tsv')` here made this checker the odd one
+  // out: it would have reported a healthy manifest while the pipeline wrote to
+  // a different one. Injected roots still resolve to {root}/data/pdf-index.tsv,
+  // which is what the self-test builds.
+  const indexPath = resolvePdfIndexPath(resolveTrackerPath(root));
   if (existsSync(indexPath)) {
     const lines = readFileSync(indexPath, 'utf8').split(/\r?\n/);
     lines.forEach((line, i) => {
@@ -96,22 +114,38 @@ export function checkBundles(root = CAREER_OPS, { allowlist = FLAT_ALLOWLIST } =
     });
   }
 
-  // 3. Version folders with no CV in them.
+  // 3. Version folders with no CV in them, and 4. deliverables loose at the
+  //    company level. listBundles() owns the walk so the layout is encoded in
+  //    ONE place; a second copy of the directory pattern here is how the old
+  //    version came to report "clean" for a shape it could no longer see.
   if (existsSync(outputDir)) {
-    for (const name of readdirSync(outputDir).sort()) {
-      const bundle = join(outputDir, name);
-      if (!/^\d{3}-/.test(name) || !statSync(bundle).isDirectory()) continue;
-      for (const version of readdirSync(bundle).sort()) {
-        const vdir = join(bundle, version);
-        if (!/^v\d{3}$/.test(version) || !statSync(vdir).isDirectory()) continue;
-        if (!existsSync(join(vdir, 'cv.pdf'))) {
-          findings.empty.push({ bundle: name, version, files: readdirSync(vdir).sort() });
+    for (const b of listBundles(root)) {
+      if (b.legacy) findings.legacy.push({ bundle: b.bundle });
+      const dir = b.company ? join(outputDir, b.company, b.bundle.split('/').pop()) : join(outputDir, b.bundle);
+      for (const v of b.versions) {
+        if (!existsSync(join(dir, v.version, 'cv.pdf'))) {
+          findings.empty.push({ bundle: b.bundle, version: v.version, files: v.files });
         }
+      }
+    }
+
+    // The company level is new, and it is a new place for a deliverable to
+    // hide. FLAT_ALLOWLIST deliberately does NOT apply here: it exists to
+    // exempt offer-agnostic artifacts (the base CV, template test renders),
+    // and inside a company folder there is no such thing — everything there
+    // belongs to one of that employer's offers.
+    for (const name of readdirSync(outputDir).sort()) {
+      const companyDir = join(outputDir, name);
+      if (/^\d{3}-/.test(name) || !statSync(companyDir).isDirectory()) continue;
+      for (const inner of readdirSync(companyDir).sort()) {
+        if (statSync(join(companyDir, inner)).isDirectory()) continue;
+        if (!DELIVERABLE_RE.test(inner)) continue;
+        findings.misplaced.push({ file: `output/${name}/${inner}` });
       }
     }
   }
 
-  const blocking = findings.stray.length + findings.dangling.length;
+  const blocking = findings.stray.length + findings.dangling.length + findings.misplaced.length;
   return { ok: blocking === 0, blocking, findings };
 }
 
@@ -128,9 +162,19 @@ function renderSummary(result) {
     for (const f of findings.dangling) lines.push(`  line ${f.line}${f.report ? ` (report ${f.report})` : ''}: ${f.path}`);
     lines.push('');
   }
+  if (findings.misplaced.length) {
+    lines.push(`Deliverables loose in a company folder (${findings.misplaced.length}) — they belong to one of that employer's offers, not to the company:`);
+    for (const f of findings.misplaced) lines.push(`  ${f.file}`);
+    lines.push('');
+  }
   if (findings.empty.length) {
     lines.push(`Version folders without a cv.pdf (${findings.empty.length}, informational):`);
     for (const f of findings.empty) lines.push(`  ${f.bundle}/${f.version} — ${f.files.join(' · ') || '(empty)'}`);
+    lines.push('');
+  }
+  if (findings.legacy.length) {
+    lines.push(`Bundles still in the flat pre-grouping layout (${findings.legacy.length}, informational) — migrate with: node migrate-bundles.mjs --apply`);
+    for (const f of findings.legacy) lines.push(`  output/${f.bundle}`);
     lines.push('');
   }
   lines.push(result.ok ? 'Bundles are clean.' : `${result.blocking} blocking finding(s).`);
@@ -151,10 +195,10 @@ function selfTest() {
   };
 
   rmSync(root, { recursive: true, force: true });
-  mkdirSync(join(root, 'output', '005-qube', 'v001'), { recursive: true });
+  mkdirSync(join(root, 'output', 'qube', '005-quantitative-developer', 'v001'), { recursive: true });
   mkdirSync(join(root, 'data'), { recursive: true });
-  writeFileSync(join(root, 'output', '005-qube', 'v001', 'cv.pdf'), 'pdf');
-  writeFileSync(join(root, 'data', 'pdf-index.tsv'), '# report\tpdf\thtml\tformat\tdate\n005\toutput/005-qube/v001/cv.pdf\t\ta4\t2026-08-15\n');
+  writeFileSync(join(root, 'output', 'qube', '005-quantitative-developer', 'v001', 'cv.pdf'), 'pdf');
+  writeFileSync(join(root, 'data', 'pdf-index.tsv'), '# report\tpdf\thtml\tformat\tdate\n005\toutput/qube/005-quantitative-developer/v001/cv.pdf\t\ta4\t2026-08-15\n');
 
   check('a tidy project reports nothing', () => {
     const r = checkBundles(root);
@@ -182,15 +226,15 @@ function selfTest() {
   });
 
   writeFileSync(join(root, 'data', 'pdf-index.tsv'),
-    '# report\tpdf\thtml\tformat\tdate\n005\toutput/005-qube/v001/cv.pdf\t\ta4\t2026-08-15\n013\toutput/013-gone/v001/cv.pdf\t\ta4\t2026-08-15\n');
+    '# report\tpdf\thtml\tformat\tdate\n005\toutput/qube/005-quantitative-developer/v001/cv.pdf\t\ta4\t2026-08-15\n013\toutput/acme/013-gone-role/v001/cv.pdf\t\ta4\t2026-08-15\n');
   check('a vanished manifest target is reported as dangling', () => {
     const r = checkBundles(root);
     eq(r.findings.dangling.length, 1, 'dangling count');
     eq(r.findings.dangling[0].report, '013', 'report number');
   });
 
-  mkdirSync(join(root, 'output', '005-qube', 'v002'), { recursive: true });
-  writeFileSync(join(root, 'output', '005-qube', 'v002', 'cover.pdf'), 'pdf');
+  mkdirSync(join(root, 'output', 'qube', '005-quantitative-developer', 'v002'), { recursive: true });
+  writeFileSync(join(root, 'output', 'qube', '005-quantitative-developer', 'v002', 'cover.pdf'), 'pdf');
   check('a version folder without cv.pdf is reported as empty', () => {
     const r = checkBundles(root);
     eq(r.findings.empty.length, 1, 'empty count');
@@ -198,7 +242,7 @@ function selfTest() {
   });
   check('empty findings do not block', () => {
     rmSync(join(root, 'output', 'cv-someone-acme-2026-08-15.pdf'));
-    writeFileSync(join(root, 'data', 'pdf-index.tsv'), '# report\tpdf\thtml\tformat\tdate\n005\toutput/005-qube/v001/cv.pdf\t\ta4\t2026-08-15\n');
+    writeFileSync(join(root, 'data', 'pdf-index.tsv'), '# report\tpdf\thtml\tformat\tdate\n005\toutput/qube/005-quantitative-developer/v001/cv.pdf\t\ta4\t2026-08-15\n');
     const r = checkBundles(root);
     eq(r.findings.empty.length, 1, 'still one empty');
     eq(r.ok, true, 'ok despite the empty version');
@@ -215,6 +259,47 @@ function selfTest() {
     if (named(checkBundles(root, { allowlist: [/^keepme\./] })).includes('output/keepme.pdf')) {
       throw new Error('expected keepme.pdf to be exempt under the custom allowlist');
     }
+    rmSync(join(root, 'output', 'keepme.pdf'));
+  });
+
+  // --- the company level: new in the grouped layout, new place to hide ---
+
+  writeFileSync(join(root, 'output', 'qube', 'cv-draft.pdf'), 'pdf');
+  check('a deliverable loose in a company folder is misplaced, and blocks', () => {
+    const r = checkBundles(root);
+    eq(r.findings.misplaced.length, 1, 'misplaced count');
+    eq(r.findings.misplaced[0].file, 'output/qube/cv-draft.pdf', 'path');
+    eq(r.ok, false, 'misplaced must block — it is a real deliverable nobody can attribute');
+  });
+  check('FLAT_ALLOWLIST does not leak into company folders', () => {
+    // `_`-prefixed files are exempt at the output/ root (scratch renders).
+    // Inside a company folder nothing is offer-agnostic, so the exemption
+    // must NOT apply — otherwise `_draft.pdf` hides forever.
+    writeFileSync(join(root, 'output', 'qube', '_draft.pdf'), 'pdf');
+    eq(checkBundles(root).findings.misplaced.length, 2, 'both reported');
+    rmSync(join(root, 'output', 'qube', '_draft.pdf'));
+    rmSync(join(root, 'output', 'qube', 'cv-draft.pdf'));
+  });
+  check('a non-deliverable in a company folder is ignored', () => {
+    writeFileSync(join(root, 'output', 'qube', 'notes.md'), 'text');
+    eq(checkBundles(root).findings.misplaced.length, 0, 'md is not a deliverable');
+  });
+
+  // --- an unmigrated tree must never read as clean ---
+
+  mkdirSync(join(root, 'output', '099-legacy-flat', 'v001'), { recursive: true });
+  writeFileSync(join(root, 'output', '099-legacy-flat', 'v001', 'cv.pdf'), 'pdf');
+  check('a flat pre-grouping bundle is reported as legacy', () => {
+    const r = checkBundles(root);
+    eq(r.findings.legacy.length, 1, 'legacy count');
+    eq(r.findings.legacy[0].bundle, '099-legacy-flat', 'legacy name');
+  });
+  check('legacy findings do not block', () => eq(checkBundles(root).ok, true, 'ok'));
+  check('a legacy bundle is still inspected for empty versions', () => {
+    mkdirSync(join(root, 'output', '099-legacy-flat', 'v002'), { recursive: true });
+    const r = checkBundles(root);
+    const legacyEmpty = r.findings.empty.filter((e) => e.bundle === '099-legacy-flat');
+    eq(legacyEmpty.length, 1, 'the old shape is checked, not skipped');
   });
 
   rmSync(root, { recursive: true, force: true });

@@ -345,9 +345,18 @@ const scripts = [
   { name: 'upskill.mjs --self-test', expectExit: 0 },
   { name: 'detect-reposts.mjs --self-test', expectExit: 0 },
   { name: 'watch.mjs --self-test', expectExit: 0 },
+  // Local scripts. These entries are erased by every `update-system.mjs apply`
+  // (test-all.mjs is manifested), which is what commit 3d21f3b was about.
+  // `node test-local.mjs` discovers them instead of listing them, so a wiped
+  // registration costs coverage only until the next run of that — re-add these
+  // when convenient, but do not rely on them being here.
   { name: 'sponsor-check.mjs --self-test', expectExit: 0 },
   { name: 'check-archetypes.mjs --self-test', expectExit: 0 },
   { name: 'kpi.mjs --self-test', expectExit: 0 },
+  { name: 'bundle.mjs --self-test', expectExit: 0 },
+  { name: 'check-bundles.mjs --self-test', expectExit: 0 },
+  { name: 'migrate-bundles.mjs --self-test', expectExit: 0 },
+  { name: 'test-local.mjs --list', expectExit: 0 },
   { name: 'rank-pipeline.mjs --self-test', expectExit: 0 },
   { name: 'discover-ats.mjs --self-test', expectExit: 0 },
   { name: 'process-quality.mjs --self-test', expectExit: 0 },

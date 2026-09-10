@@ -2,17 +2,31 @@
 /**
  * bundle.mjs — Per-offer deliverable folders for career-ops
  *
- * Places every application deliverable (CV, cover letter, JD) under a folder
- * named after the offer, with one subfolder per regeneration:
+ * Places every application deliverable (CV, cover letter, JD) under the
+ * EMPLOYER, then the offer, then one subfolder per regeneration:
  *
- *   output/{NNN}-{company-slug}/
- *   ├── jd.md
- *   ├── v001/{cv.pdf,cv.html,cover.pdf,cover.md}
- *   └── v002/...
+ *   output/{company-slug}/
+ *   └── {NNN}-{role-slug}/
+ *       ├── jd.md
+ *       ├── v001/{cv.pdf,cv.html,cover.pdf,cover.md}
+ *       └── v002/...
  *
- * The company slug is read from the report filename in reports/
- * ({NNN}-{slug}-{YYYY-MM-DD}.md), so it never has to be passed in or guessed,
- * and it stays consistent with the report the tracker links to.
+ * Company and role come from the report's `## Machine Summary` fence via
+ * lib/report-identity.mjs — see that file for why the fence beats both the H1
+ * and the filename. The short version: `reports/021-algoquant-….md` and
+ * `reports/022-algoquant-….md` reduce to the SAME filename slug, so the old
+ * layout produced `output/021-algoquant/` and `output/022-algoquant/`, two
+ * folders no one could tell apart without opening them. That is the bug this
+ * layout removes.
+ *
+ * Grouping is not hypothetical: across the 23 reports in this repo, four
+ * employers already carry more than one offer (IMC 007/015, Jane Street
+ * 010/011, Santander 017/018, ALGOQUANT 021/022).
+ *
+ * The report number stays in the path because it is the key the tracker,
+ * data/pdf-index.tsv and reports/ all join on — and it makes the role folder
+ * unique inside a company by construction, so the role slug is free to be
+ * short and readable rather than defensive.
  *
  * This script deliberately does NOT touch data/pdf-index.tsv. That manifest is
  * owned by generate-pdf.mjs, which writes it when given --report; duplicating
@@ -40,13 +54,18 @@
 
 import { existsSync, mkdirSync, readdirSync, renameSync, statSync, writeFileSync, rmSync } from 'fs';
 import { join, dirname, basename, relative } from 'path';
-import { fileURLToPath } from 'url';
 import { tmpdir } from 'os';
 
 import { flagValue, hasFlag } from './lib/cli-flags.mjs';
 import { isMainModule } from './lib/is-main-module.mjs';
+import { reportIdentity, filenameSlug } from './lib/report-identity.mjs';
+import { getCareerOpsRoot } from './path-resolver.mjs';
 
-const CAREER_OPS = dirname(fileURLToPath(import.meta.url));
+// The DATA root, not the code root. reports/ and output/ are user layer and
+// follow CAREER_OPS_ROOT / CAREER_OPS_DATA_DIR / a .career-ops-data marker
+// (DATA_CONTRACT.md). They coincide in a plain checkout, which is exactly why
+// deriving them from this file's own directory reads as correct and is not.
+const CAREER_OPS = getCareerOpsRoot();
 
 const USAGE = `Usage:
   node bundle.mjs next <report>                 # create and print the next version dir
@@ -67,8 +86,15 @@ export function padReport(value) {
 }
 
 /**
- * Read the company slug out of the report filename.
+ * LEGACY. The pre-grouping folder slug, read out of the report filename.
  * reports/017-santander-market-risk-2026-08-06.md -> "santander-market-risk"
+ *
+ * No longer used to BUILD a path — that is bundleDir()'s job via
+ * lib/report-identity.mjs. It survives because the migration has to find the
+ * old `output/{NNN}-{slug}/` directories, and because it is the honest name
+ * for what that string is: a hand-made company+role disambiguator, which is
+ * exactly why it cannot serve as a company folder name (it disagrees with the
+ * report's own `company:` field for 9 of the 23 reports here).
  */
 export function resolveSlug(report, root = CAREER_OPS) {
   const num = padReport(report);
@@ -81,8 +107,14 @@ export function resolveSlug(report, root = CAREER_OPS) {
   return slug;
 }
 
-/** Absolute path of the bundle folder for one report. */
+/** Absolute path of the bundle folder for one report: output/{company}/{NNN}-{role}. */
 export function bundleDir(report, root = CAREER_OPS) {
+  const id = reportIdentity(report, root);
+  return join(root, 'output', id.companySlug, `${id.num}-${id.roleSlug}`);
+}
+
+/** Absolute path of the PRE-grouping bundle folder. Used only by the migration. */
+export function legacyBundleDir(report, root = CAREER_OPS) {
   return join(root, 'output', `${padReport(report)}-${resolveSlug(report, root)}`);
 }
 
@@ -132,24 +164,42 @@ export function adoptFile(report, filePath, { as, root = CAREER_OPS } = {}) {
   return destination;
 }
 
-/** Every bundle currently on disk, with its versions and their contents. */
+/**
+ * Every bundle currently on disk, with its versions and their contents.
+ *
+ * Walks BOTH shapes on purpose. A pre-migration `output/{NNN}-{slug}/` is
+ * reported with `legacy: true` rather than skipped, because the failure mode
+ * of a filter that matches nothing is an empty list and exit 0 — an
+ * unmigrated tree that reads as healthy. Anything that treats this list as
+ * "the bundles" should check the flag.
+ */
 export function listBundles(root = CAREER_OPS) {
   const out = join(root, 'output');
   if (!existsSync(out)) return [];
-  return readdirSync(out)
-    .filter((f) => /^\d{3}-/.test(f) && statSync(join(out, f)).isDirectory())
-    .sort()
-    .map((name) => {
-      const dir = join(out, name);
-      return {
-        bundle: name,
-        report: name.slice(0, 3),
-        versions: listVersions(dir).map((n) => ({
-          version: vtag(n),
-          files: readdirSync(join(dir, vtag(n))).sort(),
-        })),
-      };
-    });
+
+  const describe = (dir, name, company, legacy) => ({
+    bundle: company ? `${company}/${name}` : name,
+    company,
+    report: name.slice(0, 3),
+    legacy,
+    versions: listVersions(dir).map((n) => ({
+      version: vtag(n),
+      files: readdirSync(join(dir, vtag(n))).sort(),
+    })),
+  });
+
+  const bundles = [];
+  for (const entry of readdirSync(out).sort()) {
+    const full = join(out, entry);
+    if (!statSync(full).isDirectory()) continue;
+    if (/^\d{3}-/.test(entry)) { bundles.push(describe(full, entry, null, true)); continue; }
+    for (const inner of readdirSync(full).sort()) {
+      const innerFull = join(full, inner);
+      if (!/^\d{3}-/.test(inner) || !statSync(innerFull).isDirectory()) continue;
+      bundles.push(describe(innerFull, inner, entry, false));
+    }
+  }
+  return bundles;
 }
 
 // --- self-test ---------------------------------------------------------------
@@ -168,8 +218,25 @@ function selfTest() {
   rmSync(root, { recursive: true, force: true });
   mkdirSync(join(root, 'reports'), { recursive: true });
   mkdirSync(join(root, 'output'), { recursive: true });
-  writeFileSync(join(root, 'reports', '005-qube-2026-08-06.md'), '# report');
-  writeFileSync(join(root, 'reports', '017-santander-market-risk-2026-08-06.md'), '# report');
+
+  // Fixtures carry a real `## Machine Summary` fence, because that is what
+  // bundleDir() now reads. A `'# report'` stub would exercise only the
+  // filename fallback and every grouping assertion below would pass for the
+  // wrong reason.
+  const writeReport = (name, { company, role, h1 = true, fence = true }) => {
+    const parts = [];
+    if (h1) parts.push(`# Evaluation: ${company} — ${role}\n`);
+    if (fence) parts.push(`## Machine Summary\n\n\`\`\`yaml\ncompany: "${company}"\nrole: "${role}"\nscore: 4.0\n\`\`\`\n`);
+    if (!h1 && !fence) parts.push('# Notes\n\nHand-written, no structure at all.\n');
+    writeFileSync(join(root, 'reports', name), parts.join('\n'));
+  };
+
+  writeReport('005-qube-2026-08-06.md', { company: 'Qube Research & Technologies', role: 'Quantitative Developer, Python' });
+  writeReport('017-santander-market-risk-2026-08-06.md', { company: 'Santander', role: 'Associate, Traded Market Risk' });
+  writeReport('021-algoquant-2026-09-07.md', { company: 'ALGOQUANT', role: 'DeFi Quant Researcher' });
+  writeReport('022-algoquant-2026-09-10.md', { company: 'ALGOQUANT', role: 'Quant Trade Researcher' });
+  writeReport('030-h1only-2026-09-01.md', { company: 'Acme Capital', role: 'Risk Analyst', fence: false });
+  writeReport('031-mystery-2026-09-01.md', { company: '', role: '', h1: false, fence: false });
 
   check('padReport zero-pads', () => eq(padReport('5'), '005', 'padReport'));
   check('padReport rejects non-numeric', () => {
@@ -190,38 +257,92 @@ function selfTest() {
   check('currentVersionPath is null on an empty bundle', () =>
     eq(currentVersionPath('005', root), null, 'current'));
 
-  mkdirSync(join(root, 'output', '005-qube', 'v001'), { recursive: true });
+  const rel = (p) => relative(root, p).replace(/\\/g, '/');
+
+  check('bundleDir groups by company and differentiates by role', () =>
+    eq(rel(bundleDir('021', root)), 'output/algoquant/021-defi-quant-researcher', 'nested path'));
+  check('two offers at one company share a folder but not a bundle', () => {
+    eq(rel(bundleDir('022', root)), 'output/algoquant/022-quant-trade-researcher', 'sibling path');
+    if (bundleDir('021', root) === bundleDir('022', root)) throw new Error('021 and 022 collided — the exact bug this layout removes');
+    eq(dirname(bundleDir('021', root)), dirname(bundleDir('022', root)), 'same company folder');
+  });
+  check('company slug drops the legal form, keeps the descriptors', () =>
+    eq(rel(bundleDir('005', root)), 'output/qube-research-technologies/005-quantitative-developer-python', 'ampersand + comma'));
+  check('identity falls back to the H1 when there is no fence', () => {
+    const id = reportIdentity('030', root);
+    eq(id.source, 'h1', 'source');
+    eq(id.companySlug, 'acme-capital', 'company');
+    eq(id.roleSlug, 'risk-analyst', 'role');
+  });
+  check('identity falls back to the filename and does NOT throw', () => {
+    const id = reportIdentity('031', root);
+    eq(id.source, 'filename', 'source');
+    eq(id.companySlug, 'mystery', 'company');
+  });
+  check('identity still throws on a report that does not exist', () => {
+    let threw = false;
+    try { reportIdentity('999', root); } catch { threw = true; }
+    if (!threw) throw new Error('expected a throw');
+  });
+
+  mkdirSync(join(bundleDir('005', root), 'v001'), { recursive: true });
   check('nextVersionPath increments past existing', () =>
     eq(basename(nextVersionPath('005', root)), 'v002', 'second version'));
   check('currentVersionPath finds the latest', () =>
     eq(basename(currentVersionPath('005', root)), 'v001', 'current'));
 
-  mkdirSync(join(root, 'output', '005-qube', 'v010'), { recursive: true });
+  mkdirSync(join(bundleDir('021', root), 'v001'), { recursive: true });
+  check('two roles at one company do not share a version counter', () =>
+    eq(basename(nextVersionPath('022', root)), 'v001', '022 is untouched by 021'));
+
+  mkdirSync(join(bundleDir('005', root), 'v010'), { recursive: true });
   check('version ordering is numeric, not lexicographic', () =>
     eq(basename(nextVersionPath('005', root)), 'v011', 'after v010'));
 
-  writeFileSync(join(root, 'output', 'stray-cover.pdf'), 'pdf');
+  // Each adoptFile check seeds its own stray. Chaining them on one file made
+  // "refuses to overwrite" pass because the previous check happened to leave
+  // the source behind — a pass for the wrong reason.
+  const seedStray = (name) => {
+    const p = join(root, 'output', name);
+    writeFileSync(p, 'pdf');
+    return p;
+  };
+
   check('adoptFile moves and renames into the latest version', () => {
-    const dest = adoptFile('005', join(root, 'output', 'stray-cover.pdf'), { as: 'cover.pdf', root });
-    eq(basename(dest), 'cover.pdf', 'name');
-    eq(basename(dirname(dest)), 'v010', 'landed in latest version');
-    if (existsSync(join(root, 'output', 'stray-cover.pdf'))) throw new Error('source still present');
+    const dest = adoptFile('005', seedStray('stray-a.pdf'), { as: 'cover.pdf', root });
+    eq(rel(dest), 'output/qube-research-technologies/005-quantitative-developer-python/v010/cover.pdf', 'full destination');
+    if (existsSync(join(root, 'output', 'stray-a.pdf'))) throw new Error('source still present');
   });
   check('adoptFile refuses to overwrite', () => {
-    writeFileSync(join(root, 'output', 'stray-cover.pdf'), 'pdf');
+    const src = seedStray('stray-b.pdf');
     let threw = false;
-    try { adoptFile('005', join(root, 'output', 'stray-cover.pdf'), { as: 'cover.pdf', root }); }
-    catch { threw = true; }
+    try { adoptFile('005', src, { as: 'cover.pdf', root }); } catch { threw = true; }
     if (!threw) throw new Error('expected a throw');
+    if (!existsSync(src)) throw new Error('a refused adopt must leave the source alone');
   });
   check('adoptFile creates v001 when the bundle is empty', () => {
-    const dest = adoptFile('017', join(root, 'output', 'stray-cover.pdf'), { as: 'cover.pdf', root });
-    eq(basename(dirname(dest)), 'v001', 'created first version');
+    const dest = adoptFile('017', seedStray('stray-c.pdf'), { as: 'cover.pdf', root });
+    eq(rel(dest), 'output/santander/017-associate-traded-market-risk/v001/cover.pdf', 'created first version');
   });
-  check('listBundles reports both bundles', () => {
-    const bundles = listBundles(root);
-    eq(bundles.length, 2, 'bundle count');
-    eq(bundles[0].bundle, '005-qube', 'first bundle');
+
+  // Created only now: the version-counter check above needs 022 absent.
+  mkdirSync(join(bundleDir('022', root), 'v001'), { recursive: true });
+  check('listBundles reports nested bundles with their company', () => {
+    const bundles = listBundles(root).filter((b) => !b.legacy);
+    eq(bundles.length, 4, 'nested bundle count');
+    eq(bundles[0].bundle, 'algoquant/021-defi-quant-researcher', 'first bundle');
+    eq(bundles[0].company, 'algoquant', 'company field');
+    eq(bundles[0].report, '021', 'report field');
+    // The whole point: two ALGOQUANT offers listed as siblings, distinguishable.
+    eq(bundles[1].bundle, 'algoquant/022-quant-trade-researcher', 'second bundle');
+    eq(bundles.filter((b) => b.company === 'algoquant').length, 2, 'grouped under one company');
+  });
+
+  mkdirSync(join(root, 'output', '099-legacy-flat', 'v001'), { recursive: true });
+  check('listBundles reports an unmigrated flat bundle instead of hiding it', () => {
+    const legacy = listBundles(root).filter((b) => b.legacy);
+    eq(legacy.length, 1, 'legacy count');
+    eq(legacy[0].bundle, '099-legacy-flat', 'legacy name');
   });
 
   rmSync(root, { recursive: true, force: true });
@@ -264,9 +385,11 @@ function main(argv) {
       if (!hasFlag(args, '--summary')) { console.log(JSON.stringify({ bundles }, null, 2)); return 0; }
       if (!bundles.length) { console.log('No per-offer bundles in output/ yet.'); return 0; }
       for (const b of bundles) {
-        console.log(`${b.bundle}`);
+        console.log(b.legacy ? `${b.bundle}   [flat — pre-grouping, run: node migrate-bundles.mjs]` : b.bundle);
         for (const v of b.versions) console.log(`  ${v.version}  ${v.files.join(' · ') || '(empty)'}`);
       }
+      const legacy = bundles.filter((b) => b.legacy).length;
+      if (legacy) console.log(`\n${legacy} bundle(s) still in the flat pre-grouping layout.`);
       return 0;
     }
     console.error(`Unknown command "${command}"\n\n${USAGE}`);
