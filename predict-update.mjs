@@ -74,6 +74,59 @@ Exit 1 when the prune would delete a tracked file.`;
 const gitIn = (root) => (...args) =>
   execFileSync('git', ['-C', root, ...args], { encoding: 'utf-8' }).split('\n').filter(Boolean);
 
+const posix = (p) => p.replace(/\\/g, '/');
+
+/**
+ * Classify everything this fork has diverged from upstream, by failure mode.
+ *
+ * The A/M split is borrowed from ../fork-cohabitation (`src/drift.mjs`), which
+ * separates a fork's divergence into `additive-files.diff` (files the fork
+ * adds) and `inplace-edits.diff` (edits to files upstream owns). That taxonomy
+ * is exactly the two ways an update destroys work, and deriving it from git
+ * beats maintaining a list by hand.
+ *
+ * It needs adapting, because that tool assumes a clone of upstream pinned at
+ * the fork's base ref, where every `M` is necessarily fork-authored. career-ops
+ * has no such clone, and a naive `git diff FETCH_HEAD --diff-filter=M` conflates
+ * two opposite things: a file THIS fork changed, and a file UPSTREAM moved ahead
+ * on while the fork stood still. Measured here, that was 81 files where only 2
+ * were real — 77 of them untouched `web/` files upstream had simply advanced.
+ *
+ * So two references are needed, not one:
+ *   - `baseline` — the most recent `chore: auto-update system files` commit, the
+ *     same anchor update-system.mjs uses. Diffing against it answers "what did I
+ *     change since the last update?"
+ *   - `FETCH_HEAD` — answers "who owns this file?"
+ *
+ * Crossing them gives the classification:
+ *   - upstream ships it AND I changed it      -> CASE B, overwrite
+ *   - upstream does not ship it, under a
+ *     SYSTEM_PATHS directory prefix           -> CASE A, deletion
+ *   - upstream does not ship it, no prefix
+ *     covers it                               -> out of reach (root .mjs, lib/…)
+ */
+export function forkDivergence(root, git, { systemPaths, userPaths, upstream }) {
+  let baseline;
+  try {
+    [baseline] = git('log', '--format=%H', '--grep=^chore: auto-update system files', '-1');
+  } catch { baseline = undefined; }
+  if (!baseline) return { baseline: null, caseA: [], caseB: [], outOfReach: [] };
+
+  const underSystem = (f) => systemPaths.some((s) => (s.endsWith('/') ? f.startsWith(s) : f === s));
+  const isDeclared = (f) => userPaths.some((u) => (u.endsWith('/') ? f.startsWith(u) : f === u));
+
+  const caseA = [];
+  const caseB = [];
+  const outOfReach = [];
+  for (const file of git('diff', baseline, '--name-only').map(posix)) {
+    const entry = { file, declared: isDeclared(file) };
+    if (upstream.has(file)) caseB.push(entry);
+    else if (underSystem(file)) caseA.push(entry);
+    else outOfReach.push(entry);
+  }
+  return { baseline, caseA, caseB, outOfReach };
+}
+
 /**
  * Predict the prune, plus what the declaration file would change about it.
  *
@@ -108,12 +161,22 @@ export function predictUpdate(root = CODE_ROOT, { git = gitIn(root) } = {}) {
   const untracked = git('ls-files', '--others', '--exclude-standard');
   const ignored = git('ls-files', '--others', '--ignored', '--exclude-standard');
 
+  const divergence = forkDivergence(root, git, {
+    systemPaths,
+    userPaths: effectiveUserPaths(root),
+    upstream: new Set(remoteFiles),
+  });
+
   return {
+    // Only case A actually destroys a file, so it alone gates the exit code.
+    // Case B reverts edits, which is recoverable from the committed diff —
+    // loud, but not a reason to refuse an update.
     ok: doomed.length === 0,
     counts: { systemPaths: systemPaths.length, localFiles: localFiles.length, remoteFiles: remoteFiles.length },
     doomed,
     doomedWithDeclaration,
     savedByDeclaration,
+    divergence,
     invisibleToPrune: { untracked: untracked.length, ignoredUntracked: ignored.length },
   };
 }
@@ -137,9 +200,32 @@ function render(r) {
     lines.push('Move them out of the code repo\'s index (gitignore + the personal repo).');
     lines.push('A declaration cannot save a file the prune never asks about.');
   }
+  const d = r.divergence;
+  if (d.baseline) {
+    lines.push('');
+    lines.push(`— CASE B: edits an apply would REVERT (upstream owns the file) —`);
+    if (!d.caseB.length) {
+      lines.push('  none');
+    } else {
+      for (const e of d.caseB) lines.push(`  ${e.file}${e.declared ? '   [declared in config/local-paths.txt]' : ''}`);
+      lines.push('');
+      lines.push('  Nothing is deleted here, which is why nothing warns — the edits simply');
+      lines.push('  come back reverted. Capture them BEFORE applying:');
+      lines.push(`    git diff ${d.baseline.slice(0, 8)} --diff-filter=M -- ${d.caseB.map((e) => e.file).join(' ')} > patches/inplace-edits.diff`);
+      lines.push('  then, after the update, `git apply --3way patches/inplace-edits.diff`.');
+      lines.push('  Expect conflicts and resolve them: upstream edits the same files, so');
+      lines.push('  --3way restores your lines and marks the overlap rather than silently');
+      lines.push('  picking a side. Run it IN this repo — --3way needs the baseline blobs,');
+      lines.push('  and fails with "repository lacks the necessary blob" anywhere else.');
+    }
+    lines.push('');
+    lines.push(`— out of the updater's reach (fork files no system prefix covers) —`);
+    lines.push(`  ${d.outOfReach.length} file(s)`);
+  }
+
   lines.push('');
   lines.push(`Invisible to the prune (not in git ls-files): ${r.invisibleToPrune.untracked} untracked, ${r.invisibleToPrune.ignoredUntracked} ignored.`);
-  lines.push(r.ok ? '\nSafe to apply, as far as deletion goes.' : '\nDo NOT apply until the listed files are out of the index.');
+  lines.push(r.ok ? '\nNothing would be DELETED.' : '\nDo NOT apply until the listed files are out of the index.');
   return lines.join('\n');
 }
 
@@ -190,6 +276,55 @@ function selfTest() {
     try { predictUpdate(CODE_ROOT, { git: fakeGit({ local: ['templates/x.html'], remote: [] }) }); }
     catch { threw = true; }
     if (!threw) throw new Error('expected a throw');
+  });
+
+  // --- forkDivergence: the case-A / case-B split ---
+
+  const divergenceGit = (changed) => (...args) => {
+    const a = args.join(' ');
+    if (a.includes('--grep=^chore: auto-update')) return ['baseline0000'];
+    if (a.includes('diff baseline0000 --name-only')) return changed;
+    return [];
+  };
+  const opts = (upstream) => ({
+    systemPaths: ['templates/', 'test-all.mjs', 'lib/ascii-fold.mjs'],
+    userPaths: ['cv.md'],
+    upstream: new Set(upstream),
+  });
+
+  check('a file upstream owns that we edited is CASE B, not case A', () => {
+    const d = forkDivergence('.', divergenceGit(['test-all.mjs']), opts(['test-all.mjs']));
+    eq(d.caseB.length, 1, 'caseB');
+    eq(d.caseB[0].file, 'test-all.mjs', 'file');
+    eq(d.caseA.length, 0, 'caseA');
+  });
+
+  check('a fork file under a system prefix is CASE A', () => {
+    const d = forkDivergence('.', divergenceGit(['templates/mine.html']), opts(['test-all.mjs']));
+    eq(d.caseA.length, 1, 'caseA');
+    eq(d.caseB.length, 0, 'caseB');
+  });
+
+  check('a fork file no prefix covers is out of reach, neither case', () => {
+    const d = forkDivergence('.', divergenceGit(['bundle.mjs']), opts(['test-all.mjs']));
+    eq(d.caseA.length, 0, 'caseA');
+    eq(d.caseB.length, 0, 'caseB');
+    eq(d.outOfReach.length, 1, 'outOfReach');
+  });
+
+  check('an upstream-advanced file we never touched is NOT reported', () => {
+    // The whole reason the baseline is used instead of FETCH_HEAD: diffing
+    // against FETCH_HEAD reported 81 files here, 77 of them untouched web/
+    // files upstream had simply moved ahead on. Only 2 were real.
+    const d = forkDivergence('.', divergenceGit([]), opts(['web/src/app/page.tsx']));
+    eq(d.caseA.length + d.caseB.length + d.outOfReach.length, 0, 'nothing reported');
+  });
+
+  check('no baseline commit yields an empty classification, not a crash', () => {
+    const git = () => { throw new Error('no such commit'); };
+    const d = forkDivergence('.', git, opts([]));
+    eq(d.baseline, null, 'baseline');
+    eq(d.caseB.length, 0, 'caseB');
   });
 
   check('a missing FETCH_HEAD is refused with a usable message', () => {
