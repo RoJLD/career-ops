@@ -279,6 +279,21 @@ function selfTest() {
     eq(id.source, 'filename', 'source');
     eq(id.companySlug, 'mystery', 'company');
   });
+  check('an undisclosed employer is filed under the agency, not a hash', () => {
+    // `?` is AGENTS.md's marker for an agency-mediated posting whose end
+    // employer is not named. It is a documented value, not a parse failure, so
+    // it must never reach companySlug()'s sha1 fallback — `company-5bab61eb`
+    // is a folder nobody can find again.
+    writeFileSync(join(root, 'reports', '040-agency-2026-09-11.md'),
+      '# Evaluation: ? — Quant Developer\n\n**Via:** MR SEARCH (Paul Boulan) — end employer undisclosed\n\n'
+      + '## Machine Summary\n\n```yaml\ncompany: "?"\nrole: "Quant Developer"\n```\n');
+    eq(rel(bundleDir('040', root)), 'output/via-mr-search/040-quant-developer', 'agency folder');
+  });
+  check('an undisclosed employer with no agency named is still readable', () => {
+    writeFileSync(join(root, 'reports', '041-anon-2026-09-11.md'),
+      '# Evaluation: ? — Data Scientist\n\n## Machine Summary\n\n```yaml\ncompany: "?"\nrole: "Data Scientist"\n```\n');
+    eq(rel(bundleDir('041', root)), 'output/undisclosed-employer/041-data-scientist', 'fallback folder');
+  });
   check('identity still throws on a report that does not exist', () => {
     let threw = false;
     try { reportIdentity('999', root); } catch { threw = true; }
