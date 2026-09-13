@@ -106,25 +106,45 @@ const posix = (p) => p.replace(/\\/g, '/');
  *     covers it                               -> out of reach (root .mjs, lib/…)
  */
 export function forkDivergence(root, git, { systemPaths, userPaths, upstream }) {
-  let baseline;
-  try {
-    [baseline] = git('log', '--format=%H', '--grep=^chore: auto-update system files', '-1');
-  } catch { baseline = undefined; }
-  if (!baseline) return { baseline: null, caseA: [], caseB: [], outOfReach: [] };
-
   const underSystem = (f) => systemPaths.some((s) => (s.endsWith('/') ? f.startsWith(s) : f === s));
   const isDeclared = (f) => userPaths.some((u) => (u.endsWith('/') ? f.startsWith(u) : f === u));
 
-  const caseA = [];
-  const caseB = [];
-  const outOfReach = [];
-  for (const file of git('diff', baseline, '--name-only').map(posix)) {
-    const entry = { file, declared: isDeclared(file) };
-    if (upstream.has(file)) caseB.push(entry);
-    else if (underSystem(file)) caseA.push(entry);
-    else outOfReach.push(entry);
-  }
-  return { baseline, caseA, caseB, outOfReach };
+  // Detection is divergence from upstream, NOT "changed since the baseline".
+  // The first version of this function used the baseline, which is the same test
+  // `atRisk` uses — and it inherited the same blind spot, discovered by actually
+  // running an update: the updater PRESERVES a modified system file and then
+  // commits its own version into the new baseline commit. The file still
+  // diverges from upstream, but it is no longer "changed since the baseline", so
+  // both `atRisk` and this function went quiet on it. Measured immediately after
+  // the 2026-09-13 apply: test-all.mjs diverged by 39 lines and was reported as
+  // `none`.
+  //
+  // Three filters, all required. Divergence alone reported 80 files here; 70+
+  // were `web/` copies that are simply stale, because `web/` appears nowhere in
+  // SYSTEM_PATHS and so is never written by an apply. `.gitignore` is likewise
+  // unmanaged — reconcileGitignore handles it append-only. With all three
+  // filters the real set was exactly one file.
+  let caseB = [];
+  try {
+    const modified = git('diff', 'FETCH_HEAD', '--diff-filter=M', '--name-only').map(posix);
+    caseB = modified
+      .filter((f) => upstream.has(f) && underSystem(f))
+      .map((f) => ({ file: f, declared: isDeclared(f) }));
+  } catch { caseB = []; }
+
+  // The baseline no longer gates detection. It still answers a second question
+  // that changes what happens THIS run: a file changed since the baseline is
+  // preserved with a .bak and an explicit "Keeping your versions"; one that is
+  // not is reverted in silence. The quiet group is the dangerous one.
+  let baseline = null;
+  let changedSinceBaseline = new Set();
+  try {
+    [baseline] = git('log', '--format=%H', '--grep=^chore: auto-update system files', '-1');
+    if (baseline) changedSinceBaseline = new Set(git('diff', baseline, '--name-only').map(posix));
+  } catch { baseline = null; }
+  for (const e of caseB) e.preservedThisRun = changedSinceBaseline.has(e.file);
+
+  return { baseline, caseA: [], caseB, outOfReach: [] };
 }
 
 /**
@@ -201,26 +221,35 @@ function render(r) {
     lines.push('A declaration cannot save a file the prune never asks about.');
   }
   const d = r.divergence;
-  if (d.baseline) {
-    lines.push('');
-    lines.push(`— CASE B: edits an apply would REVERT (upstream owns the file) —`);
-    if (!d.caseB.length) {
-      lines.push('  none');
-    } else {
-      for (const e of d.caseB) lines.push(`  ${e.file}${e.declared ? '   [declared in config/local-paths.txt]' : ''}`);
-      lines.push('');
-      lines.push('  Nothing is deleted here, which is why nothing warns — the edits simply');
-      lines.push('  come back reverted. Capture them BEFORE applying:');
-      lines.push(`    git diff ${d.baseline.slice(0, 8)} --diff-filter=M -- ${d.caseB.map((e) => e.file).join(' ')} > patches/inplace-edits.diff`);
-      lines.push('  then, after the update, `git apply --3way patches/inplace-edits.diff`.');
-      lines.push('  Expect conflicts and resolve them: upstream edits the same files, so');
-      lines.push('  --3way restores your lines and marks the overlap rather than silently');
-      lines.push('  picking a side. Run it IN this repo — --3way needs the baseline blobs,');
-      lines.push('  and fails with "repository lacks the necessary blob" anywhere else.');
+  lines.push('');
+  lines.push('— CASE B: edits an apply would REVERT (upstream owns the file, and it is managed) —');
+  if (!d.caseB.length) {
+    lines.push('  none');
+  } else {
+    for (const e of d.caseB) {
+      const tags = [
+        e.preservedThisRun ? 'preserved this run (.bak + notice)' : 'REVERTED IN SILENCE',
+        e.declared ? 'declared in config/local-paths.txt' : null,
+      ].filter(Boolean);
+      lines.push(`  ${e.file}   [${tags.join(' · ')}]`);
     }
+    const quiet = d.caseB.filter((e) => !e.preservedThisRun);
     lines.push('');
-    lines.push(`— out of the updater's reach (fork files no system prefix covers) —`);
-    lines.push(`  ${d.outOfReach.length} file(s)`);
+    if (quiet.length) {
+      lines.push(`  ${quiet.length} of these changed BEFORE the last update, so the updater no longer`);
+      lines.push('  recognises them as locally modified: no .bak, no "Keeping your versions",');
+      lines.push('  nothing in the log. That is the preserved-file decay — protection lasts');
+      lines.push('  exactly one apply. Capture them or lose them:');
+    } else {
+      lines.push('  These changed since the last update, so this run preserves them with a .bak.');
+      lines.push('  That protection expires after ONE apply. Capture them anyway:');
+    }
+    lines.push(`    git diff FETCH_HEAD --diff-filter=M -- ${d.caseB.map((e) => e.file).join(' ')} > patches/inplace-edits.diff`);
+    lines.push('  then, after the update, `git apply --3way patches/inplace-edits.diff`.');
+    lines.push('  Expect conflicts and resolve them: upstream edits the same files, so');
+    lines.push('  --3way restores your lines and marks the overlap rather than silently');
+    lines.push('  picking a side. Run it IN this repo — --3way needs the blobs, and fails');
+    lines.push('  with "repository lacks the necessary blob" anywhere else.');
   }
 
   lines.push('');
@@ -280,10 +309,17 @@ function selfTest() {
 
   // --- forkDivergence: the case-A / case-B split ---
 
-  const divergenceGit = (changed) => (...args) => {
+  // `divergent` = files differing from FETCH_HEAD; `sinceBase` = files changed
+  // since the last updater commit. The two are deliberately independent, which
+  // is the whole correction: a file can be divergent without being recent.
+  const divergenceGit = ({ divergent = [], sinceBase = [], noBaseline = false }) => (...args) => {
     const a = args.join(' ');
-    if (a.includes('--grep=^chore: auto-update')) return ['baseline0000'];
-    if (a.includes('diff baseline0000 --name-only')) return changed;
+    if (a.includes('--grep=^chore: auto-update')) {
+      if (noBaseline) throw new Error('no such commit');
+      return ['baseline0000'];
+    }
+    if (a.includes('diff baseline0000 --name-only')) return sinceBase;
+    if (a.includes('--diff-filter=M')) return divergent;
     return [];
   };
   const opts = (upstream) => ({
@@ -292,39 +328,42 @@ function selfTest() {
     upstream: new Set(upstream),
   });
 
-  check('a file upstream owns that we edited is CASE B, not case A', () => {
-    const d = forkDivergence('.', divergenceGit(['test-all.mjs']), opts(['test-all.mjs']));
+  check('a managed upstream file we edited is CASE B', () => {
+    const d = forkDivergence('.', divergenceGit({ divergent: ['test-all.mjs'], sinceBase: ['test-all.mjs'] }), opts(['test-all.mjs']));
     eq(d.caseB.length, 1, 'caseB');
     eq(d.caseB[0].file, 'test-all.mjs', 'file');
-    eq(d.caseA.length, 0, 'caseA');
+    eq(d.caseB[0].preservedThisRun, true, 'preserved this run');
   });
 
-  check('a fork file under a system prefix is CASE A', () => {
-    const d = forkDivergence('.', divergenceGit(['templates/mine.html']), opts(['test-all.mjs']));
-    eq(d.caseA.length, 1, 'caseA');
+  check('CASE B is still reported when the edit predates the last update', () => {
+    // The regression this function was rewritten for. The updater preserves a
+    // modified system file, then commits its own version into the new baseline;
+    // the file still diverges from upstream but is no longer "changed since the
+    // baseline". The old implementation reported `none` — verified live on
+    // test-all.mjs right after the 2026-09-13 apply, 39 lines divergent.
+    const d = forkDivergence('.', divergenceGit({ divergent: ['test-all.mjs'], sinceBase: [] }), opts(['test-all.mjs']));
+    eq(d.caseB.length, 1, 'caseB');
+    eq(d.caseB[0].preservedThisRun, false, 'reverted in silence');
+  });
+
+  check('an UNMANAGED upstream file is not CASE B, however divergent', () => {
+    // web/ appears nowhere in SYSTEM_PATHS, so an apply never writes it. Those
+    // copies are merely stale. Divergence alone reported 80 files here; 70+
+    // were this.
+    const d = forkDivergence('.', divergenceGit({ divergent: ['web/src/app/page.tsx'] }), opts(['web/src/app/page.tsx']));
     eq(d.caseB.length, 0, 'caseB');
   });
 
-  check('a fork file no prefix covers is out of reach, neither case', () => {
-    const d = forkDivergence('.', divergenceGit(['bundle.mjs']), opts(['test-all.mjs']));
-    eq(d.caseA.length, 0, 'caseA');
-    eq(d.caseB.length, 0, 'caseB');
-    eq(d.outOfReach.length, 1, 'outOfReach');
+  check('a fork file upstream does not ship is not CASE B', () => {
+    const d = forkDivergence('.', divergenceGit({ divergent: ['templates/mine.html'] }), opts([]));
+    eq(d.caseB.length, 0, 'caseB — deletion is case A, computed by staleSystemFiles');
   });
 
-  check('an upstream-advanced file we never touched is NOT reported', () => {
-    // The whole reason the baseline is used instead of FETCH_HEAD: diffing
-    // against FETCH_HEAD reported 81 files here, 77 of them untouched web/
-    // files upstream had simply moved ahead on. Only 2 were real.
-    const d = forkDivergence('.', divergenceGit([]), opts(['web/src/app/page.tsx']));
-    eq(d.caseA.length + d.caseB.length + d.outOfReach.length, 0, 'nothing reported');
-  });
-
-  check('no baseline commit yields an empty classification, not a crash', () => {
-    const git = () => { throw new Error('no such commit'); };
-    const d = forkDivergence('.', git, opts([]));
+  check('a missing baseline still yields CASE B, only without the annotation', () => {
+    const d = forkDivergence('.', divergenceGit({ divergent: ['test-all.mjs'], noBaseline: true }), opts(['test-all.mjs']));
     eq(d.baseline, null, 'baseline');
-    eq(d.caseB.length, 0, 'caseB');
+    eq(d.caseB.length, 1, 'detection must not depend on the baseline');
+    eq(d.caseB[0].preservedThisRun, false, 'unknown treated as unprotected');
   });
 
   check('a missing FETCH_HEAD is refused with a usable message', () => {
