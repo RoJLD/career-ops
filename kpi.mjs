@@ -52,22 +52,26 @@ const REPORTS_DIR = path.join(DATA_ROOT, 'reports');
 const TRACKER_PATH = path.join(DATA_ROOT, 'data', 'applications.md');
 const SCAN_HISTORY_PATH = path.join(DATA_ROOT, 'data', 'scan-history.tsv');
 
-/** Read a file, or return '' when it is absent. Missing data is never an error here. */
+/** Read a file, or return '' when it is absent. Missing data is never an error here —
+ *  an unreadable file is (EISDIR, EACCES, EBUSY): "nothing" and "cannot see" must not
+ *  produce the same board (the cockpit funnel has no other source). */
 function readOr(filePath, fallback = '') {
   try {
     return fs.readFileSync(filePath, 'utf-8');
-  } catch {
-    return fallback;
+  } catch (err) {
+    if (err?.code === 'ENOENT') return fallback;
+    throw new Error(`cannot read ${filePath}: ${err.message}`);
   }
 }
 
-/** Parse every report's Machine Summary. Unreadable files are skipped, never fatal. */
+/** Parse every report's Machine Summary. A missing reports/ is an empty pipeline; an unreadable one is an error. */
 function loadReports(dir = REPORTS_DIR) {
   let names = [];
   try {
     names = fs.readdirSync(dir).filter((n) => n.endsWith('.md'));
-  } catch {
-    return [];
+  } catch (err) {
+    if (err?.code === 'ENOENT') return [];
+    throw new Error(`cannot list ${dir}: ${err.message}`);
   }
   return names.map((name) => {
     const parsed = parseReportSummary(readOr(path.join(dir, name)));
@@ -76,6 +80,8 @@ function loadReports(dir = REPORTS_DIR) {
 }
 
 function gather({ threshold = DEFAULT_THRESHOLD } = {}) {
+  const racine = fs.statSync(DATA_ROOT, { throwIfNoEntry: false });
+  if (!racine?.isDirectory()) throw new Error(`data root is not a directory: ${DATA_ROOT}`);
   const reports = loadReports();
   const trackerText = readOr(TRACKER_PATH);
   const tracker = computeTrackerStats(trackerText);
@@ -105,6 +111,9 @@ kpi.mjs — stage-gated KPI board
 A KPI is shown as locked when its denominator is zero, together with what
 would unlock it. A rate over a real denominator is shown even at 0% — that
 is a measurement; a rate over an empty denominator is not.
+
+Exit codes: 0 board printed · 2 bad argument · 3 data unreadable (root missing,
+tracker or reports unreadable) — never a plausible empty board on stdout.
 `.trim());
 }
 
@@ -133,7 +142,13 @@ function main(argv) {
     threshold = raw;
   }
 
-  const result = gather({ threshold });
+  let result;
+  try {
+    result = gather({ threshold });
+  } catch (err) {
+    console.error(`kpi: ${err.message}`); // exit 3 : « je ne vois rien » n'est jamais rendu comme « rien »
+    return 3;
+  }
 
   if (summary) {
     const today = new Date().toISOString().slice(0, 10);
@@ -264,6 +279,21 @@ function selfTest() {
     check(run('--bogus').status === 2, 'an unknown flag is refused (exit 2), never silently ignored');
     check(run('--threshold').status === 2, '--threshold without a value is refused (exit 2)');
     check(run('--threshold', '3.5', '--json').status === 0, '--threshold with a value still works with --json');
+    // « rien » ≠ « je ne vois rien » (revue L0, 2026-09-29) : une racine ou un tracker illisible
+    // sort en 3 sur stderr — jamais un tableau vide plausible sur stdout.
+    const avec = (root) => spawnSync(process.execPath, [self, '--json'],
+      { encoding: 'utf-8', env: { ...process.env, CAREER_OPS_ROOT: root } });
+    const fichier = path.join(emptyRoot, 'pas-un-dossier');
+    fs.writeFileSync(fichier, 'x');
+    const r3 = avec(fichier);
+    check(r3.status === 3 && r3.stdout === '' && /^kpi: /.test(r3.stderr),
+      'a root that is not a directory exits 3 on stderr, nothing on stdout');
+    const r4 = avec(path.join(emptyRoot, 'absente'));
+    check(r4.status === 3 && r4.stdout === '', 'a missing root exits 3, never a plausible empty board');
+    fs.mkdirSync(path.join(emptyRoot, 'data', 'applications.md'), { recursive: true }); // tracker = DOSSIER → EISDIR
+    const r5 = run('--json');
+    check(r5.status === 3 && r5.stdout === '' && /applications\.md/.test(r5.stderr),
+      'an unreadable tracker (EISDIR) exits 3 and names the file');
     fs.rmSync(emptyRoot, { recursive: true, force: true });
   }
 
