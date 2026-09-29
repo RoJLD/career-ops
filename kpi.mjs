@@ -4,6 +4,7 @@
  *
  *   node kpi.mjs --summary        human-readable board
  *   node kpi.mjs                  JSON
+ *   node kpi.mjs --json           machine-readable JSON (same as no flag; refuses --summary)
  *   node kpi.mjs --threshold 3.8  override the apply-worthy score floor
  *   node kpi.mjs --self-test      run the embedded test suite
  *
@@ -34,6 +35,11 @@ import {
   DEFAULT_THRESHOLD,
   KPI_DEFS,
 } from './kpi-core.mjs';
+import { spawnSync } from 'node:child_process';
+import os from 'node:os';
+import { fileURLToPath } from 'node:url';
+
+const KNOWN_FLAGS = ['--json', '--summary', '--threshold', '--self-test', '--help', '-h'];
 
 // Every path below is user-layer, so all three resolve from the DATA root,
 // which getCareerOpsRoot() reads from CAREER_OPS_ROOT / a .career-ops-data
@@ -92,6 +98,7 @@ kpi.mjs — stage-gated KPI board
 
   node kpi.mjs --summary          human-readable board
   node kpi.mjs                    JSON
+  node kpi.mjs --json             machine-readable JSON (same as no flag; refuses --summary)
   node kpi.mjs --threshold 3.8    override the apply-worthy score floor (default ${DEFAULT_THRESHOLD})
   node kpi.mjs --self-test        run the embedded test suite
 
@@ -104,12 +111,22 @@ is a measurement; a rate over an empty denominator is not.
 function main(argv) {
   if (argv.includes('--help') || argv.includes('-h')) return usage(), 0;
   if (argv.includes('--self-test')) return selfTest();
+  // Un flag inconnu était ignoré en silence (mesuré 2026-09-29) : le cockpit qui appelle
+  // `kpi.mjs --json` doit savoir que ce contrat existe, pas tomber dessus par accident.
+  const unknown = argv.filter((a, i) => a.startsWith('-') && !KNOWN_FLAGS.includes(a) && argv[i - 1] !== '--threshold');
+  if (unknown.length) {
+    console.error(`kpi: unrecognized flag(s): ${unknown.join(', ')}. Valid: ${KNOWN_FLAGS.join(', ')}`);
+    return 2;
+  }
+  const json = argv.includes('--json');
+  const summary = argv.includes('--summary');
+  if (json && summary) { console.error('kpi: --json and --summary are mutually exclusive'); return 2; }
 
   let threshold = DEFAULT_THRESHOLD;
   const ti = argv.indexOf('--threshold');
   if (ti !== -1) {
     const raw = Number(argv[ti + 1]);
-    if (!Number.isFinite(raw)) {
+    if (argv[ti + 1] === undefined || !Number.isFinite(raw)) {
       console.error(`kpi: --threshold expects a number, got "${argv[ti + 1] ?? ''}"`);
       return 2;
     }
@@ -118,11 +135,11 @@ function main(argv) {
 
   const result = gather({ threshold });
 
-  if (argv.includes('--summary')) {
+  if (summary) {
     const today = new Date().toISOString().slice(0, 10);
     console.log(formatSummary(result, { today }));
   } else {
-    console.log(JSON.stringify(result, null, 2));
+    console.log(JSON.stringify(result, null, 2)); // --json et « sans flag » : même sortie
   }
   return 0;
 }
@@ -229,6 +246,26 @@ function selfTest() {
   check(new Set(keys).size === keys.length, 'KPI keys are unique');
   check(KPI_DEFS.every((d) => typeof d.unlock === 'string' && d.unlock.length > 0),
     'every KPI definition ships an unlock condition');
+
+  // -- Contrat CLI : --json explicite, flags inconnus refusés (cockpit L2 en dépend) --
+  // Bloc à part : selfTest() déclare déjà `parsed` plus haut.
+  {
+    const self = fileURLToPath(import.meta.url);
+    const emptyRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'kpi-selftest-'));
+    const run = (...args) => spawnSync(process.execPath, [self, ...args],
+      { encoding: 'utf-8', env: { ...process.env, CAREER_OPS_ROOT: emptyRoot } });
+    const r = run('--json');
+    let sortie = null; try { sortie = JSON.parse(r.stdout); } catch {}
+    check(r.status === 0 && sortie !== null, '--json exits 0 and prints parseable JSON');
+    check(sortie?.stage === 'entry' && Array.isArray(sortie?.kpis) && sortie.kpis.length === KPI_DEFS.length,
+      '--json on an empty root yields the entry stage and one row per KPI_DEF');
+    check(sortie?.kpis.every((k) => k.state === 'locked'), '--json on an empty root locks every KPI');
+    check(run('--json', '--summary').status === 2, '--json with --summary is refused (exit 2)');
+    check(run('--bogus').status === 2, 'an unknown flag is refused (exit 2), never silently ignored');
+    check(run('--threshold').status === 2, '--threshold without a value is refused (exit 2)');
+    check(run('--threshold', '3.5', '--json').status === 0, '--threshold with a value still works with --json');
+    fs.rmSync(emptyRoot, { recursive: true, force: true });
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   return fail === 0 ? 0 : 1;
