@@ -71,8 +71,11 @@ const USAGE = `Usage:
 Needs a FETCH_HEAD: run \`node update-system.mjs check\` first.
 Exit 1 when the prune would delete a tracked file.`;
 
+// 1 MB (the execFileSync default) is less than `ls-files --ignored` once
+// web/node_modules is installed: 17,734 paths, 1.16 MB, and the run died ENOBUFS.
 const gitIn = (root) => (...args) =>
-  execFileSync('git', ['-C', root, ...args], { encoding: 'utf-8' }).split('\n').filter(Boolean);
+  execFileSync('git', ['-C', root, ...args], { encoding: 'utf-8', maxBuffer: 256 * 1024 * 1024 })
+    .split('\n').filter(Boolean);
 
 const posix = (p) => p.replace(/\\/g, '/');
 
@@ -124,12 +127,29 @@ export function forkDivergence(root, git, { systemPaths, userPaths, upstream }) 
   // SYSTEM_PATHS and so is never written by an apply. `.gitignore` is likewise
   // unmanaged — reconcileGitignore handles it append-only. With all three
   // filters the real set was exactly one file.
+  //
+  // And a fourth, because "diverges from FETCH_HEAD" only means "mine" while
+  // FETCH_HEAD is the version last applied. Three releases later (2026-10-01)
+  // it listed 340 files, 339 of which held nothing but an older upstream
+  // version: the update itself, read as a revert. So the question is asked of
+  // the content, not the position: has upstream EVER shipped this exact blob at
+  // this path? Then overwriting it loses nothing upstream does not still have.
+  // A file that cannot be hashed stays CASE B — unknown is never "safe".
   let caseB = [];
+  const behind = [];
+  let base = null;
   try {
     const modified = git('diff', 'FETCH_HEAD', '--diff-filter=M', '--name-only').map(posix);
-    caseB = modified
-      .filter((f) => upstream.has(f) && underSystem(f))
-      .map((f) => ({ file: f, declared: isDeclared(f) }));
+    const managed = modified.filter((f) => upstream.has(f) && underSystem(f));
+    const history = upstreamHistory(git);
+    const blobs = localBlobs(git, managed);
+    for (const f of managed) {
+      const key = `${f}\0${blobs.get(f)}`;
+      if (!blobs.has(f) || !history.shipped.has(key)) { caseB.push({ file: f, declared: isDeclared(f) }); continue; }
+      behind.push(f);
+      const at = history.introduced.get(key);
+      if (at && (!base || at.rank < base.rank)) base = at;
+    }
   } catch { caseB = []; }
 
   // The baseline no longer gates detection. It still answers a second question
@@ -144,7 +164,63 @@ export function forkDivergence(root, git, { systemPaths, userPaths, upstream }) 
   } catch { baseline = null; }
   for (const e of caseB) e.preservedThisRun = changedSinceBaseline.has(e.file);
 
-  return { baseline, caseA: [], caseB, outOfReach: [] };
+  // `upstreamBase` is what a capture must diff FROM. Diffing from FETCH_HEAD
+  // also records the inverse of every upstream change to the file, so the
+  // "restore my edits" step would undo the update. The newest upstream commit
+  // whose content the checkout still holds is the closest thing to the version
+  // the edits were made on; with nothing behind, FETCH_HEAD is that version.
+  return { baseline, upstreamBase: base?.commit ?? null, behind, caseA: [], caseB, outOfReach: [] };
+}
+
+const isNullBlob = (b) => /^0+$/.test(b);
+
+/**
+ * Every blob upstream main ever shipped, per path, and the newest main commit
+ * that introduced each one (`rank` 0 = newest).
+ *
+ * Read along main's first-parent chain, each merge diffed against its first
+ * parent: that covers every state main has ever been in, and nothing else.
+ * Walking side branches too lets a feature branch's "Merge branch 'main' into
+ * feat/…" — diffed against the branch — re-introduce hundreds of main's blobs
+ * days after main shipped them, and win the base estimate (95612bba over
+ * bb641dc9, live). One pass rather than a pathspec per file: the whole history
+ * measured at 2 MB and half a second for 2,515 commits.
+ */
+export function upstreamHistory(git) {
+  const shipped = new Set();
+  const introduced = new Map();
+  let commit = null;
+  let rank = -1;
+  const lines = git('-c', 'core.quotePath=false', 'log', '--first-parent', '--raw', '--no-abbrev', '--no-renames',
+    '--diff-merges=first-parent', '--format=%H', 'FETCH_HEAD');
+  for (const line of lines) {
+    if (/^[0-9a-f]{40}$/.test(line)) { commit = line; rank += 1; continue; }
+    if (!line.startsWith(':')) continue;
+    const [meta, path] = line.split('\t');
+    const [, , oldBlob, newBlob] = meta.split(' ');
+    const p = posix(path);
+    for (const b of [oldBlob, newBlob]) if (!isNullBlob(b)) shipped.add(`${p}\0${b}`);
+    const key = `${p}\0${newBlob}`;
+    if (!isNullBlob(newBlob) && !introduced.has(key)) introduced.set(key, { commit, rank });
+  }
+  return { shipped, introduced };
+}
+
+/**
+ * The blob each working-tree file would be committed as (`hash-object` applies
+ * the same eol filters `git add` does). Chunked to stay under the Windows
+ * command-line limit; a chunk that fails or answers short leaves its files
+ * unhashed, which the caller treats as CASE B.
+ */
+function localBlobs(git, files) {
+  const blobs = new Map();
+  for (let i = 0; i < files.length; i += 200) {
+    const chunk = files.slice(i, i + 200);
+    let out = [];
+    try { out = git('hash-object', '--', ...chunk); } catch { continue; }
+    if (out.length === chunk.length) chunk.forEach((f, j) => blobs.set(f, out[j]));
+  }
+  return blobs;
 }
 
 /**
@@ -244,12 +320,22 @@ function render(r) {
       lines.push('  These changed since the last update, so this run preserves them with a .bak.');
       lines.push('  That protection expires after ONE apply. Capture them anyway:');
     }
-    lines.push(`    git diff FETCH_HEAD --diff-filter=M -- ${d.caseB.map((e) => e.file).join(' ')} > patches/inplace-edits.diff`);
+    const from = d.upstreamBase ?? 'FETCH_HEAD';
+    lines.push(`    git diff ${from} --diff-filter=M -- ${d.caseB.map((e) => e.file).join(' ')} > patches/inplace-edits.diff`);
+    if (d.upstreamBase) {
+      lines.push(`  (from ${d.upstreamBase.slice(0, 8)}, the newest upstream commit this checkout still matches —`);
+      lines.push('  NOT from FETCH_HEAD, which would also record the inverse of the update)');
+    }
     lines.push('  then, after the update, `git apply --3way patches/inplace-edits.diff`.');
     lines.push('  Expect conflicts and resolve them: upstream edits the same files, so');
     lines.push('  --3way restores your lines and marks the overlap rather than silently');
     lines.push('  picking a side. Run it IN this repo — --3way needs the blobs, and fails');
     lines.push('  with "repository lacks the necessary blob" anywhere else.');
+  }
+  if (d.behind?.length) {
+    lines.push('');
+    lines.push(`Behind upstream, not edited: ${d.behind.length} managed file(s) hold a version upstream itself`);
+    lines.push('once shipped. The apply brings them up to date; nothing of yours is in them.');
   }
 
   lines.push('');
@@ -312,8 +398,13 @@ function selfTest() {
   // `divergent` = files differing from FETCH_HEAD; `sinceBase` = files changed
   // since the last updater commit. The two are deliberately independent, which
   // is the whole correction: a file can be divergent without being recent.
-  const divergenceGit = ({ divergent = [], sinceBase = [], noBaseline = false }) => (...args) => {
+  // `blobs` = what `hash-object` says each local file is; `history` = upstream's
+  // `log --raw` lines. Absent, a file is unhashable and history is empty, so the
+  // tests above exercise the conservative path: unknown is CASE B.
+  const divergenceGit = ({ divergent = [], sinceBase = [], noBaseline = false, blobs = {}, history = [] }) => (...args) => {
     const a = args.join(' ');
+    if (args.includes('hash-object')) return args.slice(args.indexOf('--') + 1).map((p) => blobs[p]).filter(Boolean);
+    if (args.includes('--raw')) return history;
     if (a.includes('--grep=^chore: auto-update')) {
       if (noBaseline) throw new Error('no such commit');
       return ['baseline0000'];
@@ -357,6 +448,52 @@ function selfTest() {
   check('a fork file upstream does not ship is not CASE B', () => {
     const d = forkDivergence('.', divergenceGit({ divergent: ['templates/mine.html'] }), opts([]));
     eq(d.caseB.length, 0, 'caseB — deletion is case A, computed by staleSystemFiles');
+  });
+
+  // Regression from 2026-10-01: three releases behind, 340 files were listed as
+  // REVERTED IN SILENCE and 339 of them held nothing but an older upstream
+  // version. The printed capture command (`git diff FETCH_HEAD …`) would have
+  // stored the inverse of the whole update as "my edits".
+  const C_NEW = 'c2'.padEnd(40, '0');
+  const C_OLD = 'c1'.padEnd(40, '0');
+  const behindGit = divergenceGit({
+    divergent: ['test-all.mjs', 'templates/a.html'],
+    blobs: { 'test-all.mjs': 'blobmine', 'templates/a.html': 'blobold' },
+    history: [
+      C_NEW, ':100644 100644 blobold blobnew M\ttemplates/a.html',
+      C_OLD, ':000000 100644 0000000000000000000000000000000000000000 blobold A\ttemplates/a.html',
+    ],
+  });
+
+  check('a file merely BEHIND upstream is not CASE B', () => {
+    const d = forkDivergence('.', behindGit, opts(['test-all.mjs', 'templates/a.html']));
+    eq(d.caseB.map((e) => e.file).join(','), 'test-all.mjs', 'caseB');
+    eq(d.behind.join(','), 'templates/a.html', 'behind');
+  });
+
+  check('the upstream base is the newest upstream commit whose content the checkout still holds', () => {
+    const d = forkDivergence('.', behindGit, opts(['test-all.mjs', 'templates/a.html']));
+    eq(d.upstreamBase, C_OLD, 'base');
+  });
+
+  check('the capture command diffs from the upstream base, never from FETCH_HEAD', () => {
+    const d = forkDivergence('.', behindGit, opts(['test-all.mjs', 'templates/a.html']));
+    const out = render({
+      counts: { systemPaths: 0, localFiles: 0, remoteFiles: 0 }, doomed: [], savedByDeclaration: [],
+      divergence: d, invisibleToPrune: { untracked: 0, ignoredUntracked: 0 }, ok: true,
+    });
+    if (!out.includes(`git diff ${C_OLD} --diff-filter=M -- test-all.mjs`)) throw new Error('capture does not start from the base');
+    if (out.includes('git diff FETCH_HEAD')) throw new Error('capture still diffs from FETCH_HEAD');
+  });
+
+  check('upstream history is read along main\'s first-parent chain only', () => {
+    // Without it, a feature branch's "Merge branch 'main' into feat/…" diffed
+    // against the BRANCH re-introduces hundreds of main's blobs, and outranks
+    // the commit actually applied: live, the base came out as 95612bba (a
+    // personio branch merge, 2026-09-18) instead of bb641dc9 (main, 09-13).
+    let query = [];
+    upstreamHistory((...args) => { query = args; return []; });
+    if (!query.includes('--first-parent')) throw new Error(`history query lacks --first-parent: ${query.join(' ')}`);
   });
 
   check('a missing baseline still yields CASE B, only without the annotation', () => {
