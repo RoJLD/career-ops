@@ -47,31 +47,79 @@ budget is a declared choice rather than a silent trim. --strict exits 1 when
 anything is omitted; the default exit is always 0, because omitting content is
 normal.`;
 
+// Accents folded (Orléans → orleans) so cv.md and the payload normalize alike.
+const norm = (s) => String(s).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+  .replace(/[^a-z0-9]+/g, ' ').trim();
+
+// Whole words of 2+ characters, so "IBM" and "EY" count but "C" and stray years do not.
+const STOPWORDS = new Set(['of', 'and', 'the', 'for', 'in', 'at', 'on', 'to', 'de', 'des', 'du', 'la', 'le', 'et', 'en']);
+const tokens = (s) => norm(s).split(' ').filter((w) => w.length > 1 && !/^\d+$/.test(w) && !STOPWORDS.has(w));
+
 /** The English half of cv.md. The French half repeats it and would double every count. */
 export function englishHalf(cvText) {
   return cvText.split(/^##\s+Fran/m)[0];
 }
 
 /**
- * Content units cv.md declares, keyed by section.
+ * Content units cv.md declares, keyed by section, as `{ title, items }`.
  *
  * Deliberately coarse: entry TITLES, not bullets. A bullet-level diff would
  * flag every legitimate reframing as an omission and drown the real signal —
  * a whole internship or project missing from the page.
+ *
+ * A `- **Label:** a, b, c` line is a list (languages, certifications, skills)
+ * and keeps its items: the label is a heading tailoring renames freely
+ * ("Languages" becomes "Spoken"), the items are what actually reaches the page.
  */
-export function cvUnits(cvText) {
+export function cvEntries(cvText) {
   const en = englishHalf(cvText);
-  const units = {};
+  const entries = {};
   let section = null;
   for (const line of en.split(/\r?\n/)) {
     const head = line.match(/^###\s+(.+?)\s*$/);
-    if (head) { section = head[1]; units[section] ??= []; continue; }
+    if (head) { section = head[1]; entries[section] ??= []; continue; }
     if (!section) continue;
     // Top-level bold entries only (`- **…**`); indented `  - ` lines are bullets.
-    const entry = line.match(/^-\s+\*\*(.+?)\*\*/);
-    if (entry) units[section].push(entry[1].replace(/\s+/g, ' ').trim());
+    const entry = line.match(/^-\s+\*\*(.+?)\*\*(.*)$/);
+    if (!entry) continue;
+    const title = entry[1].replace(/\s+/g, ' ').trim();
+    entries[section].push({ title, items: title.endsWith(':') ? listItems(entry[2]) : [] });
   }
-  return units;
+  return entries;
+}
+
+/** Entry titles only, keyed by section. */
+export function cvUnits(cvText) {
+  return Object.fromEntries(Object.entries(cvEntries(cvText)).map(([s, list]) => [s, list.map((e) => e.title)]));
+}
+
+const stripParens = (s) => {
+  let out = s;
+  while (/\([^()]*\)/.test(out)) out = out.replace(/\([^()]*\)/g, ' ');
+  return out;
+};
+
+/** "French (Native), English (Fluent, TOEIC 880/990)" → ["French", "English"]. */
+export function listItems(text) {
+  return stripParens(text).split(/[,;|]|\s[—–]\s/).map((s) => s.trim()).filter((s) => norm(s));
+}
+
+const MONTH = /\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b\.?/gi;
+const isDateSegment = (s) => /\d{4}/.test(s)
+  && !s.replace(MONTH, '').replace(/\d{4}|present|today/gi, '').replace(/[\s–—\-/.]+/g, '');
+
+/**
+ * The part of an entry title that names it.
+ *
+ * cv.md titles read "<dates> — <name>, <location> — <role>". The name is what
+ * identifies the entry; the location is shared between entries (one city on
+ * two jobs in the regression test) and the role is reworded by tailoring. So: first
+ * non-date segment, before its first comma, without parenthesised descriptors
+ * and without a "Mid-Studies Project:" style prefix.
+ */
+export function entryName(title) {
+  const named = title.split(/\s+—\s+/).find((s) => !isDateSegment(s)) ?? title;
+  return stripParens(named).split(',')[0].replace(/^[^:]*:\s*(?=\S)/, '').trim();
 }
 
 /** Strings the payload actually renders, flattened. */
@@ -86,22 +134,51 @@ export function payloadStrings(payload) {
   return out;
 }
 
-const norm = (s) => String(s).toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+/** Payload text, normalized once: whole-word phrases are matched against `text`, tokens against `tokens`. */
+export function haystack(strings) {
+  const text = norm(strings.join(' | '));
+  return { text: ` ${text} `, tokens: new Set(text.split(' ')) };
+}
 
 /**
- * Is this cv.md unit represented anywhere in the payload?
- *
- * Matched on the unit's most distinctive token run rather than the whole title,
- * because tailoring rewrites titles freely and legitimately: cv.md's
- * "2021–2026 — ECE Paris, Engineering Cycle" becomes "Engineering Cycle: Major
- * in …" with org "ECE Paris". A whole-string test would call that an omission.
+ * The tokens that identify each non-list entry: its name's tokens, minus those
+ * another entry's name also carries ("paris" in both "IBM Paris" and "Acme
+ * Paris" tells neither apart). An entry whose tokens are all shared keeps them all.
  */
-export function isRepresented(unit, haystack) {
-  const words = norm(unit).split(' ').filter((w) => w.length > 3 && !/^\d+$/.test(w));
-  if (!words.length) return true;
-  const hay = norm(haystack.join(' | '));
-  const hits = words.filter((w) => hay.includes(w)).length;
-  return hits / words.length >= 0.5;
+export function entryKeys(entries) {
+  const named = entries.filter((e) => !e.items.length);
+  const own = new Map(named.map((e) => [e, new Set(tokens(entryName(e.title)))]));
+  const df = new Map();
+  for (const set of own.values()) for (const t of set) df.set(t, (df.get(t) ?? 0) + 1);
+  const keys = new Map();
+  for (const [e, set] of own) {
+    const all = [...set];
+    const distinctive = all.filter((t) => df.get(t) === 1);
+    keys.set(e, distinctive.length ? distinctive : all.length ? all : tokens(e.title));
+  }
+  return keys;
+}
+
+/**
+ * Is this cv.md entry represented anywhere in the payload?
+ *
+ * Matched on what identifies the entry rather than the whole title, because
+ * tailoring rewrites titles freely and legitimately: cv.md's "2021–2026 — ECE
+ * Paris, Engineering Cycle" becomes "Engineering Cycle: Major in …" with org
+ * "ECE Paris". A whole-string test would call that an omission; a test on every
+ * word let a shared city, "France" and "support" carry an omitted entry.
+ *
+ * A list line is on the page when at least half its items are, whatever the
+ * category is called there — and only then: its label alone ("Project
+ * Management") proves nothing when the same words title a certification.
+ */
+export function isRepresented(entry, hay, keys = tokens(entryName(entry.title))) {
+  const want = entry.items.length ? entry.items.map(norm) : keys;
+  if (!want.length) return true;
+  const found = entry.items.length
+    ? want.filter((phrase) => hay.text.includes(` ${phrase} `))
+    : want.filter((t) => hay.tokens.has(t));
+  return found.length / want.length >= 0.5;
 }
 
 /** Page count from a PDF, without a parser dependency. */
@@ -113,15 +190,16 @@ export function pdfPages(path) {
 }
 
 export function coverage(payload, cvText, { pdfPath } = {}) {
-  const units = cvUnits(cvText);
-  const strings = payloadStrings(payload);
+  const entries = cvEntries(cvText);
+  const keys = entryKeys(Object.values(entries).flat());
+  const hay = haystack(payloadStrings(payload));
   const sections = {};
   let included = 0;
   let omitted = 0;
-  for (const [section, list] of Object.entries(units)) {
+  for (const [section, list] of Object.entries(entries)) {
     const kept = [];
     const cut = [];
-    for (const u of list) (isRepresented(u, strings) ? kept : cut).push(u);
+    for (const e of list) (isRepresented(e, hay, keys.get(e)) ? kept : cut).push(e.title);
     sections[section] = { kept, cut };
     included += kept.length;
     omitted += cut.length;
@@ -188,6 +266,54 @@ function selfTest() {
   });
   check('a missing PDF yields null pages, not a crash', () =>
     eq(pdfPages('does-not-exist.pdf'), null, 'pages'));
+
+  // Regressions from a real tailored CV (2026-10-01): an omitted job carried by
+  // shared words, languages and certifications kept under other labels.
+  const SHARED_CITY = [
+    '## English', '', '### Professional Experience', '',
+    '- **Jan – Aug 2022 — Acme, Nantes, France — Phone Support Agent**',
+    '- **Jun – Sep 2021 — Globex / NOVA, Nantes, France — Sales Representative**',
+  ].join('\n');
+  check('an entry whose only matches are a shared location and common words is reported', () => {
+    const r = coverage({
+      experience: [{ company: 'Globex / NOVA', location: 'Nantes, France', role: 'Sales Representative' }],
+      projects: [{ title: 'Orbit - Distributed multi-agent framework', description: 'a quantitative decision-support tool' }],
+    }, SHARED_CITY);
+    eq(r.totals.omitted, 1, 'omitted');
+    eq(r.sections['Professional Experience'].cut[0].includes('Acme'), true, 'which');
+  });
+  check('a project reworded around its name still counts; its sibling does not ride on the shared prefix', () => {
+    const r = coverage({ projects: [{ title: 'Volatility Surface Fitting (ENSX x EY) - Project Lead' }], education: [{ org: 'ENSX Paris' }] },
+      '## English\n\n### Academic Projects\n\n'
+      + '- **Sep 2025 – Feb 2026 — Final-Year Project: Volatility Surface Fitting (ENSX × EY), Paris — Project Lead**\n'
+      + '- **Sep 2023 – Feb 2024 — Second-Year Project: Inflation Nowcasting (ENSX)**\n');
+    eq(r.sections['Academic Projects'].kept.length, 1, 'kept');
+    eq(r.sections['Academic Projects'].cut[0].includes('Nowcasting'), true, 'which');
+  });
+
+  const SKILLS = [
+    '## English', '', '### Languages & Skills', '',
+    '- **Languages:** French (Native), English (Fluent, TOEIC 880/990), German (Conversational)',
+    '- **Certifications:** Acme Academy — Project Management, Data Analyst, Cloud Practitioner',
+    '- **Project Management:** Agile (Scrum, Kanban), V-Model, Lean Management, Capacity Planning',
+  ].join('\n');
+  const SKILLS_PAYLOAD = {
+    skills: [{ category: 'Spoken', items: ['French (native)', 'English (fluent, TOEIC 880/990)', 'German (conversational)'] }],
+    certifications: ['Project Management', 'Data Analyst', 'Cloud Practitioner'].map((title) => ({ title, org: 'Acme Academy' })),
+  };
+  check('a skill line counts through its items when the payload renames its category', () => {
+    const r = coverage(SKILLS_PAYLOAD, SKILLS);
+    eq(r.sections['Languages & Skills'].kept.includes('Languages:'), true, 'Languages kept');
+  });
+  check('certifications count through the payload certifications section', () => {
+    const r = coverage(SKILLS_PAYLOAD, SKILLS);
+    eq(r.sections['Languages & Skills'].kept.includes('Certifications:'), true, 'Certifications kept');
+  });
+  check('a skill line whose label survives but whose items do not is reported', () => {
+    // "Project Management" is on the page as a certification title; none of the line's items are.
+    const r = coverage(SKILLS_PAYLOAD, SKILLS);
+    eq(r.sections['Languages & Skills'].cut.join(','), 'Project Management:', 'cut');
+  });
 
   for (const [n, ok, err] of results) console.log(`${ok ? 'ok  ' : 'FAIL'} ${n}${ok ? '' : ` — ${err}`}`);
   const failed = results.filter((r) => !r[1]).length;
